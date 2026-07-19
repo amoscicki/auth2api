@@ -149,6 +149,16 @@ gate, then auth2api forces `thinking=true` and the selected `effort`. auth2api
 uses Cursor CLI's exploded variant selectors internally; they are parameter
 presets, not separate models.
 
+Codex model picker entries are allowlisted in
+`src/upstream/cursor-model-registry.ts`. Current entries:
+
+- `cursor-claude-fable-5`: `thinking=true`, selected
+  `effort=low|medium|high`
+- `cursor-grok-4.5-fast`: `fast=true`, selected
+  `effort=low|medium|high`
+
+Cursor CLI Max mode is global and applies to both entries.
+
 Codex custom provider example:
 
 ```toml

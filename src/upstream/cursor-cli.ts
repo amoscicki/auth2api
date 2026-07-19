@@ -4,6 +4,10 @@ import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { isDebugLevel } from "../config";
 import { CallCursorResponsesOptions, CursorSseFormat } from "./cursor-api";
 import { __resolveCursorModel } from "./cursor-api";
+import {
+  CursorCodexEffort,
+  findCursorCodexModel,
+} from "./cursor-model-registry";
 
 type CursorAgentMode = "ask" | "plan" | "agent";
 
@@ -71,7 +75,7 @@ function promptFromBody(body: any): string {
 
 function requestedReasoningEffort(
   body: any,
-): "low" | "medium" | "high" | undefined {
+): CursorCodexEffort | undefined {
   const effort = body?.reasoning?.effort || body?.reasoning_effort;
   if (effort === "low" || effort === "medium" || effort === "high") {
     return effort;
@@ -80,20 +84,18 @@ function requestedReasoningEffort(
 }
 
 function resolveCursorCliModel(body: any): string {
-  const resolved = __resolveCursorModel(
-    String(body?.model || "cursor-default"),
-  ).replace(/\[[^\]]*\]$/, "");
-  const isFable = /^claude-fable-5(?:-|$)/i.test(resolved);
-  const effort =
-    requestedReasoningEffort(body) || (isFable ? "high" : undefined);
-  if (isFable) {
-    // Cursor exposes one parameterized Fable 5 model. Headless CLI lists its
-    // valid parameter combinations as exploded variant selectors; these are
-    // selectors, not separate SKUs. Cursor CLI Max mode is an independent
-    // premium-model access gate; this selector enforces thinking=true plus
-    // chosen effort.
-    return `claude-fable-5-thinking-${effort}`;
+  const requestedModel = String(body?.model || "cursor-default");
+  const registered = findCursorCodexModel(requestedModel);
+  if (registered) {
+    return registered.cliSelector(
+      requestedReasoningEffort(body) || registered.defaultEffort,
+    );
   }
+  const resolved = __resolveCursorModel(requestedModel).replace(
+    /\[[^\]]*\]$/,
+    "",
+  );
+  const effort = requestedReasoningEffort(body);
   if (!effort) return resolved;
   if (/-(?:low|medium|high|xhigh|max)(-fast)?$/i.test(resolved)) {
     return resolved.replace(
