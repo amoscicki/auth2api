@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { isDebugLevel } from "../config";
 import { CallCursorResponsesOptions, CursorSseFormat } from "./cursor-api";
 import { __resolveCursorModel } from "./cursor-api";
 
@@ -68,16 +69,42 @@ function promptFromBody(body: any): string {
   return sections.join("\n\n") || "Continue.";
 }
 
-function forceMaxModel(model: string): string {
-  const resolved = __resolveCursorModel(model);
-  if (/\[[^\]]*\]$/.test(resolved)) {
-    const base = resolved.replace(/\[[^\]]*\]$/, "");
-    return `${base}[effort=max]`;
+function requestedReasoningEffort(
+  body: any,
+): "low" | "medium" | "high" | undefined {
+  const effort = body?.reasoning?.effort || body?.reasoning_effort;
+  if (effort === "low" || effort === "medium" || effort === "high") {
+    return effort;
   }
-  if (/-(?:low|medium|high|xhigh|max)$/i.test(resolved)) {
-    return resolved.replace(/-(?:low|medium|high|xhigh|max)$/i, "-max");
+  return undefined;
+}
+
+function resolveCursorCliModel(body: any): string {
+  const resolved = __resolveCursorModel(
+    String(body?.model || "cursor-default"),
+  ).replace(/\[[^\]]*\]$/, "");
+  const isFable = /^claude-fable-5(?:-|$)/i.test(resolved);
+  const effort =
+    requestedReasoningEffort(body) || (isFable ? "high" : undefined);
+  if (isFable) {
+    // Cursor exposes one parameterized Fable 5 model. Headless CLI lists its
+    // valid parameter combinations as exploded variant selectors; these are
+    // selectors, not separate SKUs. Cursor CLI Max mode is an independent
+    // premium-model access gate; this selector enforces thinking=true plus
+    // chosen effort.
+    return `claude-fable-5-thinking-${effort}`;
   }
-  return `${resolved}[effort=max]`;
+  if (!effort) return resolved;
+  if (/-(?:low|medium|high|xhigh|max)(-fast)?$/i.test(resolved)) {
+    return resolved.replace(
+      /-(?:low|medium|high|xhigh|max)(-fast)?$/i,
+      `-${effort}$1`,
+    );
+  }
+  if (/-fast$/i.test(resolved)) {
+    return resolved.replace(/-fast$/i, `-${effort}-fast`);
+  }
+  return `${resolved}-${effort}`;
 }
 
 function cursorAgentMode(options: CallCursorResponsesOptions): CursorAgentMode {
@@ -140,6 +167,7 @@ function responseStream(
   format: CursorSseFormat,
   signal: AbortSignal | undefined,
   timeoutMs: number,
+  verbose: boolean,
 ): ReadableStream<Uint8Array> {
   const responseId = `resp_cursor_${Date.now().toString(36)}`;
   const messageId = `msg_cursor_${Date.now().toString(36)}`;
@@ -413,6 +441,17 @@ function responseStream(
         } catch {
           return;
         }
+        if (
+          verbose &&
+          parsed?.type === "system" &&
+          parsed?.subtype === "init"
+        ) {
+          const resolvedModel =
+            parsed?.model || parsed?.model_name || parsed?.modelName;
+          console.log(
+            `[cursor] CLI resolved model: ${resolvedModel || "unknown"}`,
+          );
+        }
         const delta = assistantDelta(parsed);
         if (delta) emitText(delta);
         if (parsed?.type === "result" && parsed?.subtype === "success") {
@@ -477,7 +516,10 @@ export async function callCursorCliResponses(
   }
 
   const body = options.body ?? options.request.body;
-  const model = forceMaxModel(String(body?.model || "cursor-default"));
+  const model = resolveCursorCliModel(body);
+  if (isDebugLevel(options.config.debug, "verbose")) {
+    console.log(`[cursor] CLI model: ${model}`);
+  }
   const workspace = cursorWorkspace(options);
   const mode = cursorAgentMode(options);
   const args = [
@@ -518,6 +560,7 @@ export async function callCursorCliResponses(
     options.responseFormat || "openai-responses",
     options.signal,
     options.config.timeouts["stream-messages-ms"],
+    isDebugLevel(options.config.debug, "verbose"),
   );
   return new Response(stream, {
     status: 200,

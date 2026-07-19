@@ -142,15 +142,19 @@ cloaking:
     api-base-url: "https://api2.cursor.sh"
 ```
 
-Every Cursor model is requested at maximum reasoning: effort-suffixed model IDs
-are rewritten to `-max`; other IDs receive Cursor's `[effort=max]` override.
+Codex exposes Fable as one picker model: `cursor-claude-fable-5`. Its
+Low/Medium/High reasoning levels map to Cursor's parameterized Fable 5 model:
+Cursor CLI Max mode stays enabled independently as the premium-model access
+gate, then auth2api forces `thinking=true` and the selected `effort`. auth2api
+uses Cursor CLI's exploded variant selectors internally; they are parameter
+presets, not separate models.
 
 Codex custom provider example:
 
 ```toml
-model = "cursor-claude-fable-5-max"
+model = "cursor-claude-fable-5"
 model_provider = "cursor_local"
-model_reasoning_effort = "max"
+model_reasoning_effort = "high"
 
 [model_providers.cursor_local]
 name = "Cursor via auth2api"
@@ -159,8 +163,9 @@ env_key = "AUTH2API_API_KEY"
 wire_api = "responses"
 
 [profiles.fable5]
-model = "cursor-claude-fable-5-max"
+model = "cursor-claude-fable-5"
 model_provider = "cursor_local"
+model_reasoning_effort = "high"
 ```
 
 When Codex requests `/v1/models?client_version=...`, auth2api returns Codex

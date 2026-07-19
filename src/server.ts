@@ -17,6 +17,116 @@ import { StatsRecorder } from "./stats/recorder";
 const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX = 60;
+const CODEX_PICKER_EFFORTS = ["low", "medium", "high"] as const;
+
+type ListedModel = {
+  id: string;
+  object: string;
+  created: number;
+  owned_by: string;
+};
+
+function codexPickerModels(data: ListedModel[]): Array<Record<string, unknown>> {
+  const groups = new Map<
+    string,
+    { model: ListedModel; index: number; efforts: Set<string> }
+  >();
+
+  for (const [index, model] of data.entries()) {
+    if (model.owned_by !== "cursor") continue;
+    const match = model.id.match(
+      /^(.*)-(low|medium|high|xhigh|max)(-fast)?$/i,
+    );
+    if (!match) continue;
+    const fableBase = match[1].replace(
+      /^cursor-claude-fable-5(?:-thinking)?$/i,
+      "cursor-claude-fable-5",
+    );
+    const id = `${fableBase}${match[3] || ""}`;
+    const group = groups.get(id) || {
+      model: { ...model, id },
+      index,
+      efforts: new Set<string>(),
+    };
+    group.index = Math.min(group.index, index);
+    group.efforts.add(match[2].toLowerCase());
+    groups.set(id, group);
+  }
+
+  const entries: Array<{
+    model: ListedModel;
+    index: number;
+    efforts: string[];
+  }> = [];
+  for (const [index, model] of data.entries()) {
+    const group = groups.get(model.id);
+    if (group) {
+      group.index = Math.min(group.index, index);
+      group.efforts.add("medium");
+      continue;
+    }
+    if (
+      !model.id.match(/-(low|medium|high|xhigh|max)(-fast)?$/i)
+    ) {
+      entries.push({ model, index, efforts: [] });
+    }
+  }
+
+  for (const [id, group] of groups) {
+    const fastSuffix = id.endsWith("-fast") ? "-fast" : "";
+    const base = fastSuffix ? id.slice(0, -fastSuffix.length) : id;
+    if (
+      base !== "cursor-claude-fable-5" &&
+      !base.endsWith("-thinking") &&
+      groups.has(`${base}-thinking${fastSuffix}`)
+    ) {
+      continue;
+    }
+    const efforts = CODEX_PICKER_EFFORTS.filter((effort) =>
+      group.efforts.has(effort),
+    );
+    if (efforts.length) {
+      entries.push({ model: group.model, index: group.index, efforts });
+    }
+  }
+
+  return entries
+    .sort((a, b) => a.index - b.index)
+    .map(({ model, efforts }, index) => {
+      const defaultEffort = efforts.includes("high")
+        ? "high"
+        : efforts.includes("medium")
+          ? "medium"
+          : efforts[0] || null;
+      return {
+        slug: model.id,
+        display_name: model.id.replace(/^cursor-/, ""),
+        description: "Cursor model via auth2api",
+        default_reasoning_level: defaultEffort,
+        supported_reasoning_levels: efforts.map((effort) => ({
+          effort,
+          description: `${effort[0].toUpperCase()}${effort.slice(1)} reasoning effort`,
+        })),
+        shell_type: "shell_command",
+        visibility: "list",
+        supported_in_api: true,
+        priority: entries.length - index,
+        availability_nux: null,
+        upgrade: null,
+        base_instructions: "",
+        supports_reasoning_summaries: false,
+        supports_reasoning_summary_parameter: false,
+        support_verbosity: false,
+        default_verbosity: null,
+        apply_patch_tool_type: null,
+        truncation_policy: { mode: "tokens", limit: 240000 },
+        supports_parallel_tool_calls: false,
+        effective_context_window_percent: 95,
+        experimental_supported_tools: [],
+        input_modalities: ["text"],
+      };
+    });
+}
 
 function rateLimit(ip: string): boolean {
   const now = Date.now();
@@ -262,37 +372,7 @@ export function createServer(
       })),
     );
     if (typeof req.query.client_version === "string") {
-      res.json({
-        models: data.map((model, index) => ({
-          slug: model.id,
-          display_name: model.id.replace(/^cursor-/, ""),
-          description: "Cursor model via auth2api",
-          default_reasoning_level: "max",
-          supported_reasoning_levels: [
-            {
-              effort: "max",
-              description: "Maximum reasoning effort",
-            },
-          ],
-          shell_type: "shell_command",
-          visibility: "list",
-          supported_in_api: true,
-          priority: data.length - index,
-          availability_nux: null,
-          upgrade: null,
-          base_instructions: "",
-          supports_reasoning_summaries: false,
-          supports_reasoning_summary_parameter: false,
-          support_verbosity: false,
-          default_verbosity: null,
-          apply_patch_tool_type: null,
-          truncation_policy: { mode: "tokens", limit: 240000 },
-          supports_parallel_tool_calls: false,
-          effective_context_window_percent: 95,
-          experimental_supported_tools: [],
-          input_modalities: ["text"],
-        })),
-      });
+      res.json({ models: codexPickerModels(data) });
       return;
     }
     res.json({ object: "list", data });
