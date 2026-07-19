@@ -58,7 +58,10 @@ node dist/index.js --login
 # Codex (ChatGPT Plus/Pro)
 node dist/index.js --login --provider=codex
 
-# Cursor (experimental; opens a browser to authorize your Cursor account)
+# Cursor Agent CLI + CURSOR_API_KEY (preferred when env var is set)
+node dist/index.js --login --provider=cursor --cursor-api-key
+
+# Cursor browser login
 node dist/index.js --login --provider=cursor
 
 # Cursor — fall back to importing the local Cursor desktop login instead of using the browser
@@ -66,7 +69,7 @@ node dist/index.js --login --provider=cursor --cursor-import-local
 node dist/index.js --login --provider=cursor --cursor-storage=/path/to/state.vscdb
 ```
 
-Anthropic and Codex open a browser URL. After authorizing, the callback is handled automatically. The Anthropic flow uses port `54545`; the Codex flow uses port `1455` — make sure neither is blocked by your firewall. Cursor uses a different "deep-link" PKCE flow: it prints a `https://cursor.com/loginDeepControl?...` URL, you click "Yes, Log In" in your browser, and `auth2api` polls `api2.cursor.sh/auth/poll` until the token is issued — no callback port required. Pass `--cursor-import-local` (or `--cursor-storage=...`) if you'd rather pull the existing token out of your Cursor desktop install.
+Anthropic and Codex open a browser URL. After authorizing, the callback is handled automatically. The Anthropic flow uses port `54545`; the Codex flow uses port `1455` — make sure neither is blocked by your firewall. With `CURSOR_API_KEY` set, Cursor login exchanges that key for account metadata and runtime requests go through the installed `cursor-agent` CLI. Without the env var, Cursor uses its browser deep-link flow. Pass `--cursor-import-local` (or `--cursor-storage=...`) to pull the existing Cursor desktop token instead.
 
 ### Manual mode (for remote servers)
 
@@ -81,7 +84,7 @@ You can run `--login` multiple times to add additional accounts (per provider). 
 
 > **Note on Codex:** The codex provider relays your ChatGPT Plus/Pro subscription quota. OpenAI's ToS does not officially permit relaying ChatGPT sessions through third-party tools — use this for your own personal local consumption only.
 
-> **Note on Cursor:** The cursor provider is a research-only integration built from non-public, reverse-engineered Cursor APIs (`api2.cursor.sh` over HTTP/2, Connect-RPC + protobuf). It may break when Cursor changes client versions, may violate Cursor's terms, and should be used only for local personal experiments.
+> **Note on Cursor:** The default transport wraps the installed, current `cursor-agent` CLI and requires `CURSOR_API_KEY` in the server environment. The old reverse-engineered protobuf transport remains available as `cloaking.cursor.transport: legacy`.
 
 ## Starting the server
 
@@ -125,15 +128,35 @@ debug: "off" # off | errors | verbose
 - `errors`: log upstream/network failures and upstream error bodies
 - `verbose`: include `errors` logs plus per-request method, path, status, and duration
 
-Cursor's reverse-engineered headers can be overridden if the upstream version gate changes. `agent-base-url` is the legacy alias for the chat host; both keys point at the same backend now (`api2.cursor.sh`).
+Cursor defaults to the installed Agent CLI. `agent-mode: ask` keeps the nested Cursor agent read-only. Set a fixed workspace when needed. `agent-mode: agent` enables Cursor's own agent loop, not Codex function calls.
 
 ```yaml
 cloaking:
   cursor:
+    transport: "cli"
+    agent-mode: "ask"
+    workspace: "P:\\your-project"
     client-version: "2.3.41"
     client-type: "ide"
     agent-base-url: "https://api2.cursor.sh"
     api-base-url: "https://api2.cursor.sh"
+```
+
+Every Cursor model is requested at maximum reasoning: effort-suffixed model IDs
+are rewritten to `-max`; other IDs receive Cursor's `[effort=max]` override.
+
+Codex custom provider example:
+
+```toml
+[model_providers.cursor_local]
+name = "Cursor via auth2api"
+base_url = "http://127.0.0.1:8317/v1"
+env_key = "AUTH2API_API_KEY"
+wire_api = "responses"
+
+[profiles.fable5]
+model = "cursor-claude-fable-5-max"
+model_provider = "cursor_local"
 ```
 
 ## Usage
@@ -224,9 +247,9 @@ Off-the-shelf OpenAI Responses / Chat / Claude Code clients all just work withou
 
 #### Cursor `/v1/responses` limitations
 
-Cursor's chat protocol is reverse-engineered: requests go to `api2.cursor.sh/aiserver.v1.ChatService/StreamUnifiedChatWithTools` over HTTP/2 + `application/connect+proto`, and the response is decoded back into OpenAI Responses SSE deltas. Stream is forced on (Cursor only supports streaming). Tool calls, images, repository context, edit actions, and Cursor's richer agent protocol are intentionally not translated yet — only single-turn streaming text is supported.
+The CLI bridge translates Cursor Agent `stream-json` assistant deltas into OpenAI Responses SSE. Cursor CLI tool executions are internal to Cursor and are not translated into Codex `function_call` items. Default `agent-mode: ask` is therefore text-only and read-only. Images and Responses structured-output schemas are not translated.
 
-The decoder routes Cursor's chain-of-thought (`reasoning`) bytes to `response.reasoning_summary_text.delta` events instead of leaking them into the main `response.output_text.delta` stream. For Composer/Kimi-style models that stream the entire response (CoT + answer) through a single reasoning channel, the decoder splits on the first `</think>` marker so the final answer still surfaces as plain `output_text`.
+`transport: legacy` restores the old HTTP/2 + protobuf path for older Cursor deployments. Its previous single-turn text and version-gate limitations still apply.
 
 ### Endpoints
 

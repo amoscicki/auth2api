@@ -57,9 +57,13 @@ cloaking:
     # Set only if the upstream begins requiring an OpenAI-Beta header.
     # openai-beta: "responses=experimental"
 
-  # Cursor provider — experimental, reverse-engineered, and not official.
-  # Override these only when Cursor changes its internal version gates.
+  # Cursor provider. CLI is current default; legacy keeps old protobuf path.
   cursor:
+    # Current Cursor Agent CLI bridge. Set legacy only to use old protobuf chat.
+    transport: "cli"
+    # ask/plan are read-only. agent lets Cursor CLI use its own tools.
+    agent-mode: "ask"
+    # workspace: "P:\\your-project"
     client-version: "2.3.41"
     client-type: "ide"
     # agent-base-url is the legacy alias; both keys point at api2.cursor.sh now.

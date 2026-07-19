@@ -6,6 +6,7 @@ import {
   callCursorResponses,
   listCursorModels,
 } from "../upstream/cursor-api";
+import { callCursorCliResponses } from "../upstream/cursor-cli";
 import { Provider, UpstreamCallContext, ProviderOAuthInfo } from "./types";
 
 const CURSOR_OAUTH: ProviderOAuthInfo = {
@@ -53,7 +54,10 @@ export function buildCursorProvider(authDir: string): Provider {
         : path.includes("/v1/chat/completions")
           ? "openai-chat-completions"
           : "openai-responses";
-      return callCursorResponses({
+      const transport = opts.config.cloaking.cursor?.transport || "cli";
+      const call =
+        transport === "legacy" ? callCursorResponses : callCursorCliResponses;
+      return call({
         body: opts.body,
         request: opts.request,
         account: opts.account,

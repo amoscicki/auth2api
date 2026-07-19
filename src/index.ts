@@ -6,6 +6,7 @@ import { generatePKCECodes } from "./auth/pkce";
 import { waitForCallback } from "./auth/callback-server";
 import { importCursorTokenFromLocalStorage } from "./auth/cursor/storage";
 import { runCursorBrowserLogin } from "./auth/cursor/browser-oauth";
+import { exchangeCursorApiKey } from "./auth/cursor/api-key";
 import { buildRegistry, ProviderRegistry } from "./providers/registry";
 import { createServer } from "./server";
 import { notifyServerReload } from "./utils/notify-reload";
@@ -74,6 +75,23 @@ async function browserCursorLogin(
   console.log(`Token expires: ${result.token.expiresAt}`);
   console.log(
     "Note: Cursor provider support is experimental and uses non-public APIs.",
+  );
+  await notifyServerReload(config);
+}
+
+async function cursorApiKeyLogin(
+  config: Config,
+  registry: ProviderRegistry,
+): Promise<void> {
+  const provider = registry.get("cursor");
+  console.log("\nExchanging CURSOR_API_KEY for Cursor account credentials.");
+  const token = await exchangeCursorApiKey();
+  provider.manager.addAccount(token);
+  console.log("Cursor API-key login complete.");
+  console.log(`Account: ${token.email}`);
+  console.log(`Token expires: ${token.expiresAt}`);
+  console.log(
+    "Runtime requests use CURSOR_API_KEY through the installed cursor-agent CLI.",
   );
   await notifyServerReload(config);
 }
@@ -224,6 +242,11 @@ async function main(): Promise<void> {
     if (providerId === "cursor") {
       if (cursorStorage || args.includes("--cursor-import-local")) {
         await importCursorLogin(config, registry, cursorStorage);
+      } else if (
+        args.includes("--cursor-api-key") ||
+        process.env.CURSOR_API_KEY
+      ) {
+        await cursorApiKeyLogin(config, registry);
       } else {
         await browserCursorLogin(config, registry);
       }

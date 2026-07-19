@@ -33,6 +33,12 @@ export interface CloakingConfig {
     "agent-base-url"?: string;
     "api-base-url"?: string;
     "config-version"?: string;
+    /** Current Cursor Agent CLI transport (default) or legacy protobuf chat. */
+    transport?: "cli" | "legacy";
+    /** CLI execution mode. ask/plan are read-only; agent enables Cursor tools. */
+    "agent-mode"?: "ask" | "plan" | "agent";
+    /** Workspace passed to cursor-agent. Defaults to auth2api process cwd. */
+    workspace?: string;
     timezone?: string;
     "ghost-mode"?: string;
   };
