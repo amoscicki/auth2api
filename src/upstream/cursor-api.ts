@@ -454,6 +454,9 @@ function encodeModelMsg(modelName: string): Uint8Array {
   return concatBytes([
     encodeBytesField(1, modelName),
     encodeBytesField(4, new Uint8Array(0)),
+    // aiserver.v1.ModelDetails.max_mode (field 8). Keep enabled for every
+    // proxied model so Max-only Cursor SKUs (including Fable 5) are accepted.
+    encodeVarintField(8, 1),
   ]);
 }
 
