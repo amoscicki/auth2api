@@ -249,7 +249,7 @@ export function createServer(
 
   app.use(["/v1", "/codex", "/backend-api/codex"], requireApiKey);
   app.use(["/v1", "/codex", "/backend-api/codex"], statsFinishMiddleware);
-  app.get("/v1/models", async (_req, res) => {
+  app.get("/v1/models", async (req, res) => {
     const created = Math.floor(Date.now() / 1000);
     const providers = registry.withAccounts();
     const lists = await Promise.all(providers.map((p) => p.listModels()));
@@ -261,6 +261,40 @@ export function createServer(
         owned_by: m.owned_by,
       })),
     );
+    if (typeof req.query.client_version === "string") {
+      res.json({
+        models: data.map((model, index) => ({
+          slug: model.id,
+          display_name: model.id.replace(/^cursor-/, ""),
+          description: "Cursor model via auth2api",
+          default_reasoning_level: "max",
+          supported_reasoning_levels: [
+            {
+              effort: "max",
+              description: "Maximum reasoning effort",
+            },
+          ],
+          shell_type: "shell_command",
+          visibility: "list",
+          supported_in_api: true,
+          priority: data.length - index,
+          availability_nux: null,
+          upgrade: null,
+          base_instructions: "",
+          supports_reasoning_summaries: false,
+          supports_reasoning_summary_parameter: false,
+          support_verbosity: false,
+          default_verbosity: null,
+          apply_patch_tool_type: null,
+          truncation_policy: { mode: "tokens", limit: 240000 },
+          supports_parallel_tool_calls: false,
+          effective_context_window_percent: 95,
+          experimental_supported_tools: [],
+          input_modalities: ["text"],
+        })),
+      });
+      return;
+    }
     res.json({ object: "list", data });
   });
 

@@ -148,6 +148,10 @@ are rewritten to `-max`; other IDs receive Cursor's `[effort=max]` override.
 Codex custom provider example:
 
 ```toml
+model = "cursor-claude-fable-5-max"
+model_provider = "cursor_local"
+model_reasoning_effort = "max"
+
 [model_providers.cursor_local]
 name = "Cursor via auth2api"
 base_url = "http://127.0.0.1:8317/v1"
@@ -158,6 +162,10 @@ wire_api = "responses"
 model = "cursor-claude-fable-5-max"
 model_provider = "cursor_local"
 ```
+
+When Codex requests `/v1/models?client_version=...`, auth2api returns Codex
+model-catalog metadata. Restart Codex after changing its active provider; the
+Cursor catalogue then appears in the model picker.
 
 ## Usage
 

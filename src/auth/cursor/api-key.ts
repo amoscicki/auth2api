@@ -60,9 +60,11 @@ export async function exchangeCursorApiKey(
     accessToken: exchanged.accessToken,
     refreshToken: exchanged.refreshToken,
     email: claims.email || claims.sub || "cursor-api-key",
-    expiresAt: claims.exp
-      ? new Date(claims.exp * 1000).toISOString()
-      : new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    // CLI transport authenticates every runtime call with CURSOR_API_KEY.
+    // The exchanged access token only creates an auth2api routing account;
+    // refreshing it through Cursor's desktop OAuth endpoint invalidates this
+    // API-key account. Keep the routing record non-expiring.
+    expiresAt: "2099-12-31T23:59:59.000Z",
     accountUuid: claims.sub || "cursor-api-key",
     provider: "cursor",
     lastRefreshAt: now,

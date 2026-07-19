@@ -61,7 +61,7 @@ function promptFromBody(body: any): string {
 
   if (Array.isArray(body?.tools) && body.tools.length > 0) {
     sections.push(
-      "Codex supplied external tool definitions, but this Cursor CLI bridge cannot return Codex function_call items. Answer in text; do not claim a tool ran.",
+      "Use Cursor CLI built-in tools when needed. Return their final result as assistant text; do not emit Codex function_call JSON.",
     );
   }
 
@@ -484,7 +484,6 @@ export async function callCursorCliResponses(
     "-p",
     "--output-format",
     "stream-json",
-    "--stream-partial-output",
     "--trust",
     "--workspace",
     workspace,
