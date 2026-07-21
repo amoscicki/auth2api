@@ -16,7 +16,6 @@ import { cursorCodexModelsAvailableIn } from "./upstream/cursor-model-registry";
 import {
   cancelCursorAcpResponse,
   getCursorAcpResponse,
-  steerCursorAcpResponse,
 } from "./upstream/cursor-acp";
 
 // Simple in-memory rate limiter per IP
@@ -359,26 +358,6 @@ export function createServer(
       return;
     }
     res.json(getCursorAcpResponse(req.params.responseId)?.response);
-  });
-  app.post("/v1/responses/:responseId/steer", async (req, res) => {
-    if (!req.body?.input && !req.body?.messages) {
-      res.status(400).json({ error: { message: "input is required" } });
-      return;
-    }
-    const steered = steerCursorAcpResponse(req.params.responseId);
-    if (!steered) {
-      res.status(409).json({
-        error: { message: "Response is not an active Cursor ACP turn" },
-      });
-      return;
-    }
-    req.body = {
-      ...req.body,
-      model: steered.model,
-      previous_response_id: req.params.responseId,
-      stream: req.body.stream ?? true,
-    };
-    await responsesHandler(req, res);
   });
   app.post(
     "/v1/responses/compact",

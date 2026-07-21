@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import yaml from "js-yaml";
 
@@ -117,7 +118,8 @@ export function isDebugLevel(
 
 export function resolveAuthDir(dir: string): string {
   if (dir.startsWith("~")) {
-    return path.join(process.env.HOME || "/root", dir.slice(1));
+    const home = process.env.HOME || process.env.USERPROFILE || os.homedir();
+    return path.join(home, dir.slice(1));
   }
   return path.resolve(dir);
 }

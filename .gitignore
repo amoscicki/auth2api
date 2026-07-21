@@ -13,3 +13,6 @@ config.yaml
 # OS metadata
 .DS_Store
 Thumbs.db
+
+proxy-local.log
+proxy-local.err.log

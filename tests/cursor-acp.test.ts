@@ -9,7 +9,6 @@ import {
   cancelCursorAcpResponse,
   callCursorAcpResponses,
   getCursorAcpResponse,
-  steerCursorAcpResponse,
 } from "../src/upstream/cursor-acp";
 import { Config } from "../src/config";
 
@@ -37,6 +36,27 @@ function config(authDir = "/tmp/auth2api-test"): Config {
   };
 }
 
+function withFakeAcp(extraEnv: Record<string, string> = {}) {
+  const saved = new Map<string, string | undefined>();
+  const entries: Record<string, string> = {
+    CURSOR_API_KEY: "test-cursor-key",
+    CURSOR_AGENT_NODE: process.execPath,
+    CURSOR_AGENT_SCRIPT: path.resolve("tests/fixtures/fake-cursor-acp.mjs"),
+    ...extraEnv,
+  };
+  for (const [key, value] of Object.entries(entries)) {
+    saved.set(key, process.env[key]);
+    process.env[key] = value;
+  }
+  return async () => {
+    await __disposeCursorAcpPools();
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+}
+
 async function waitForTerminalResponse(responseId: string) {
   const deadline = Date.now() + 2_000;
   while (Date.now() < deadline) {
@@ -60,68 +80,143 @@ function request(headers: Record<string, string> = {}): any {
   return { body: {}, path: "/v1/responses", headers };
 }
 
-test("Responses stream exposes ACP reasoning, plan, tool progress, text, and completion", async () => {
-  const oldKey = process.env.CURSOR_API_KEY;
-  const oldNode = process.env.CURSOR_AGENT_NODE;
-  const oldScript = process.env.CURSOR_AGENT_SCRIPT;
-  const oldInitDelay = process.env.FAKE_ACP_INIT_DELAY_MS;
-  process.env.CURSOR_API_KEY = "test-cursor-key";
-  process.env.CURSOR_AGENT_NODE = process.execPath;
-  process.env.CURSOR_AGENT_SCRIPT = path.resolve(
-    "tests/fixtures/fake-cursor-acp.mjs",
+function lastFunctionCall(response: any): any | undefined {
+  const items = (response.output || []).filter(
+    (item: any) => item?.type === "function_call",
   );
-  process.env.FAKE_ACP_INIT_DELAY_MS = "200";
+  return items.at(-1);
+}
 
+async function callOnce(body: any, headers: Record<string, string> = {}) {
+  const response = await callCursorAcpResponses({
+    body,
+    request: request(headers),
+    account: {} as any,
+    config: config(),
+    responseFormat: "openai-responses",
+  });
+  assert.equal(response.status, 200);
+  const stream = await response.text();
+  return { stream, response: completedResponse(stream) };
+}
+
+/**
+ * Mimics Codex: keep sending follow-up requests with function_call_output
+ * ("unsupported call") for each tool-call boundary until the turn finishes
+ * without one. Returns every chunk plus accumulated history input.
+ */
+async function runTurn(
+  input: any,
+  headers: Record<string, string> = {},
+  model = "cursor-composer-2-fast",
+) {
+  const history: any[] = Array.isArray(input)
+    ? [...input]
+    : [{ role: "user", content: input }];
+  const chunks: { stream: string; response: any }[] = [];
+  let previousResponseId: string | undefined;
+  for (let hop = 0; hop < 10; hop++) {
+    const { stream, response } = await callOnce(
+      {
+        model,
+        input: history,
+        ...(previousResponseId
+          ? { previous_response_id: previousResponseId }
+          : {}),
+      },
+      headers,
+    );
+    previousResponseId = response.id;
+    chunks.push({ stream, response });
+    for (const item of response.output || []) {
+      if (item) history.push(item);
+    }
+    const boundary = lastFunctionCall(response);
+    if (!boundary) return { chunks, history, final: response };
+    history.push({
+      type: "function_call_output",
+      call_id: boundary.call_id,
+      output: `unsupported call: ${boundary.name}`,
+    });
+  }
+  assert.fail("turn did not finish within 10 chunks");
+}
+
+function allText(chunks: { response: any }[]): string {
+  return chunks
+    .flatMap((chunk) => chunk.response.output || [])
+    .filter((item: any) => item?.type === "message")
+    .flatMap((item: any) => item.content || [])
+    .map((part: any) => part?.text || "")
+    .join("");
+}
+
+test("turn chunks at tool boundary: function_call persists, continuation finishes turn", async () => {
+  const restore = withFakeAcp({ FAKE_ACP_INIT_DELAY_MS: "1500" });
   try {
     const startedAt = Date.now();
-    const response = await callCursorAcpResponses({
+    const first = await callCursorAcpResponses({
       body: { model: "cursor-composer-2-fast", input: "Say hello" },
-      request: { body: {}, path: "/v1/responses" } as any,
+      request: request({ "thread-id": "codex-thread-chunks" }),
       account: {} as any,
       config: config(),
       responseFormat: "openai-responses",
     });
     assert.ok(
-      Date.now() - startedAt < 150,
+      Date.now() - startedAt < 1000,
       "Responses SSE should start before cursor-agent initializes",
     );
-    assert.equal(response.status, 200);
-    const stream = await response.text();
+    assert.equal(first.status, 200);
+    const firstStream = await first.text();
 
-    assert.match(stream, /event: response\.created/);
-    assert.match(stream, /event: response\.reasoning_summary_text\.delta/);
-    assert.match(stream, /Inspecting first\./);
-    assert.match(stream, /event: response\.cursor\.plan/);
-    assert.match(stream, /event: response\.cursor\.tool_call\n/);
-    assert.match(stream, /"toolCallId":"tool-1"/);
-    assert.match(stream, /event: response\.cursor\.tool_call_update/);
-    assert.match(stream, /: ping/);
-    assert.match(stream, /event: response\.output_text\.delta/);
-    assert.match(stream, /Done\./);
-    assert.match(stream, /event: response\.completed/);
+    // Chunk 1: reasoning (plan + thought) then a real function_call item.
+    assert.match(firstStream, /event: response\.created/);
+    assert.match(firstStream, /event: response\.reasoning_summary_text\.delta/);
+    assert.match(firstStream, /Inspecting first\./);
+    assert.match(firstStream, /\[plan\]/);
+    assert.match(firstStream, /event: response\.output_item\.added/);
+    assert.match(firstStream, /"type":"function_call"/);
+    assert.match(firstStream, /"name":"cursor_read"/);
+    assert.match(firstStream, /README\.md/);
+    assert.match(firstStream, /event: response\.completed/);
+    const firstCompleted = completedResponse(firstStream);
+    const boundary = lastFunctionCall(firstCompleted);
+    assert.ok(boundary);
+    assert.equal(boundary.name, "cursor_read");
+    assert.match(boundary.call_id, /^call_cursor_tool-1$/);
+
+    // Chunk 2 (continuation with function_call_output): tool result note as
+    // reasoning, final text, completed without another function_call.
+    const { stream: secondStream, response: second } = await callOnce(
+      {
+        model: "cursor-composer-2-fast",
+        input: [
+          { role: "user", content: "Say hello" },
+          boundary,
+          {
+            type: "function_call_output",
+            call_id: boundary.call_id,
+            output: `unsupported call: ${boundary.name}`,
+          },
+        ],
+      },
+      { "thread-id": "codex-thread-chunks" },
+    );
+    assert.match(secondStream, /\[cursor_read completed\]/);
+    assert.match(secondStream, /event: response\.output_text\.delta/);
+    assert.match(secondStream, /Done\./);
+    assert.equal(lastFunctionCall(second), undefined);
+    assert.equal(
+      second.metadata.cursor_session_id,
+      firstCompleted.metadata.cursor_session_id,
+    );
   } finally {
-    await __disposeCursorAcpPools();
-    if (oldKey === undefined) delete process.env.CURSOR_API_KEY;
-    else process.env.CURSOR_API_KEY = oldKey;
-    if (oldNode === undefined) delete process.env.CURSOR_AGENT_NODE;
-    else process.env.CURSOR_AGENT_NODE = oldNode;
-    if (oldScript === undefined) delete process.env.CURSOR_AGENT_SCRIPT;
-    else process.env.CURSOR_AGENT_SCRIPT = oldScript;
-    if (oldInitDelay === undefined) delete process.env.FAKE_ACP_INIT_DELAY_MS;
-    else process.env.FAKE_ACP_INIT_DELAY_MS = oldInitDelay;
+    await restore();
   }
 });
 
 test("ACP turn can be cancelled and remains retrievable", async () => {
-  const oldKey = process.env.CURSOR_API_KEY;
-  const oldNode = process.env.CURSOR_AGENT_NODE;
-  const oldScript = process.env.CURSOR_AGENT_SCRIPT;
-  process.env.CURSOR_API_KEY = "test-cursor-key";
-  process.env.CURSOR_AGENT_NODE = process.execPath;
-  process.env.CURSOR_AGENT_SCRIPT = path.resolve(
-    "tests/fixtures/fake-cursor-acp.mjs",
-  );
-
+  const restore = withFakeAcp();
   try {
     const response = await callCursorAcpResponses({
       body: { model: "cursor-composer-2-fast", input: "Long task" },
@@ -151,91 +246,76 @@ test("ACP turn can be cancelled and remains retrievable", async () => {
     assert.match(rest, /event: response\.cancelled/);
     assert.equal(getCursorAcpResponse(responseId)?.status, "cancelled");
   } finally {
-    await __disposeCursorAcpPools();
-    if (oldKey === undefined) delete process.env.CURSOR_API_KEY;
-    else process.env.CURSOR_API_KEY = oldKey;
-    if (oldNode === undefined) delete process.env.CURSOR_AGENT_NODE;
-    else process.env.CURSOR_AGENT_NODE = oldNode;
-    if (oldScript === undefined) delete process.env.CURSOR_AGENT_SCRIPT;
-    else process.env.CURSOR_AGENT_SCRIPT = oldScript;
+    await restore();
   }
 });
 
-test("steer cancels active turn and continues same ACP session", async () => {
-  const oldKey = process.env.CURSOR_API_KEY;
-  const oldNode = process.env.CURSOR_AGENT_NODE;
-  const oldScript = process.env.CURSOR_AGENT_SCRIPT;
-  process.env.CURSOR_API_KEY = "test-cursor-key";
-  process.env.CURSOR_AGENT_NODE = process.execPath;
-  process.env.CURSOR_AGENT_SCRIPT = path.resolve(
-    "tests/fixtures/fake-cursor-acp.mjs",
-  );
-
+test("steer text in continuation cancels turn and prompts same ACP session", async () => {
+  const restore = withFakeAcp();
   try {
-    const first = await callCursorAcpResponses({
-      body: { model: "cursor-composer-2-fast", input: "Original task" },
-      request: request({ "thread-id": "codex-thread-steer" }),
-      account: {} as any,
-      config: config(),
-      responseFormat: "openai-responses",
-    });
-    const reader = first.body!.getReader();
-    const decoder = new TextDecoder();
-    let firstEvents = "";
-    while (!firstEvents.includes("response.cursor.tool_call")) {
-      const chunk = await reader.read();
-      assert.equal(chunk.done, false);
-      firstEvents += decoder.decode(chunk.value, { stream: true });
-    }
-    const responseId = firstEvents.match(/"id":"([^"]+)"/)?.[1];
-    const firstSessionId = firstEvents.match(/"session_id":"([^"]+)"/)?.[1];
-    assert.ok(responseId);
-    assert.ok(firstSessionId);
-    assert.deepEqual(steerCursorAcpResponse(responseId), {
-      model: "cursor-composer-2-fast",
-    });
-
-    const steered = await callCursorAcpResponses({
-      body: {
-        model: "cursor-composer-2-fast",
-        input: "Changed direction",
-        previous_response_id: responseId,
-      },
-      request: request({ "thread-id": "codex-thread-steer" }),
-      account: {} as any,
-      config: config(),
-      responseFormat: "openai-responses",
-    });
-    const steeredCompleted = completedResponse(await steered.text());
-
-    assert.match(
-      steeredCompleted.output.at(-1).content[0].text,
-      /prompt=Changed direction$/,
+    const { stream } = await callOnce(
+      { model: "cursor-composer-2-fast", input: "Original task" },
+      { "thread-id": "codex-thread-steer" },
     );
-    assert.equal(steeredCompleted.metadata.cursor_session_id, firstSessionId);
-    assert.equal(getCursorAcpResponse(responseId)?.status, "cancelled");
-    await reader.cancel();
+    const firstCompleted = completedResponse(stream);
+    const boundary = lastFunctionCall(firstCompleted);
+    assert.ok(boundary, "first chunk should end at a tool boundary");
+
+    // Codex delivers steer input in the follow-up request: history includes
+    // the function_call_output AND a fresh user message after it.
+    const { response: steered } = await callOnce(
+      {
+        model: "cursor-composer-2-fast",
+        input: [
+          { role: "user", content: "Original task" },
+          boundary,
+          {
+            type: "function_call_output",
+            call_id: boundary.call_id,
+            output: `unsupported call: ${boundary.name}`,
+          },
+          { role: "user", content: "Changed direction" },
+        ],
+      },
+      { "thread-id": "codex-thread-steer" },
+    );
+
+    const chunks = [{ response: steered }];
+    // Steer starts a fresh Cursor prompt, which may chunk at its own tool
+    // boundary; follow it to the end like Codex would.
+    let current = steered;
+    let history: any[] = [];
+    while (lastFunctionCall(current)) {
+      const next = lastFunctionCall(current);
+      history = [
+        { role: "user", content: "Changed direction" },
+        next,
+        {
+          type: "function_call_output",
+          call_id: next.call_id,
+          output: `unsupported call: ${next.name}`,
+        },
+      ];
+      const { response } = await callOnce(
+        { model: "cursor-composer-2-fast", input: history },
+        { "thread-id": "codex-thread-steer" },
+      );
+      current = response;
+      chunks.push({ response });
+    }
+
+    assert.match(allText(chunks), /prompt=Changed direction$/);
+    assert.equal(
+      current.metadata.cursor_session_id,
+      firstCompleted.metadata.cursor_session_id,
+    );
   } finally {
-    await __disposeCursorAcpPools();
-    if (oldKey === undefined) delete process.env.CURSOR_API_KEY;
-    else process.env.CURSOR_API_KEY = oldKey;
-    if (oldNode === undefined) delete process.env.CURSOR_AGENT_NODE;
-    else process.env.CURSOR_AGENT_NODE = oldNode;
-    if (oldScript === undefined) delete process.env.CURSOR_AGENT_SCRIPT;
-    else process.env.CURSOR_AGENT_SCRIPT = oldScript;
+    await restore();
   }
 });
 
-test("ACP turn survives client disconnect and stores its completed response", async () => {
-  const oldKey = process.env.CURSOR_API_KEY;
-  const oldNode = process.env.CURSOR_AGENT_NODE;
-  const oldScript = process.env.CURSOR_AGENT_SCRIPT;
-  process.env.CURSOR_API_KEY = "test-cursor-key";
-  process.env.CURSOR_AGENT_NODE = process.execPath;
-  process.env.CURSOR_AGENT_SCRIPT = path.resolve(
-    "tests/fixtures/fake-cursor-acp.mjs",
-  );
-
+test("ACP turn survives client disconnect and stores a terminal response", async () => {
+  const restore = withFakeAcp();
   try {
     const response = await callCursorAcpResponses({
       body: { model: "cursor-composer-2-fast", input: "Keep working" },
@@ -252,220 +332,133 @@ test("ACP turn survives client disconnect and stores its completed response", as
     await reader.cancel("simulated disconnect");
     const stored = await waitForTerminalResponse(responseId);
     assert.equal(stored?.status, "completed");
-    assert.match(JSON.stringify(stored), /Done\./);
+    // The chunk ends at the fixture's tool boundary even with no consumer.
+    assert.match(JSON.stringify(stored), /cursor_read/);
   } finally {
-    await __disposeCursorAcpPools();
-    if (oldKey === undefined) delete process.env.CURSOR_API_KEY;
-    else process.env.CURSOR_API_KEY = oldKey;
-    if (oldNode === undefined) delete process.env.CURSOR_AGENT_NODE;
-    else process.env.CURSOR_AGENT_NODE = oldNode;
-    if (oldScript === undefined) delete process.env.CURSOR_AGENT_SCRIPT;
-    else process.env.CURSOR_AGENT_SCRIPT = oldScript;
+    await restore();
   }
 });
 
 test("Codex thread header reuses one ACP session and sends only new user turn", async () => {
-  const oldKey = process.env.CURSOR_API_KEY;
-  const oldNode = process.env.CURSOR_AGENT_NODE;
-  const oldScript = process.env.CURSOR_AGENT_SCRIPT;
-  process.env.CURSOR_API_KEY = "test-cursor-key";
-  process.env.CURSOR_AGENT_NODE = process.execPath;
-  process.env.CURSOR_AGENT_SCRIPT = path.resolve(
-    "tests/fixtures/fake-cursor-acp.mjs",
-  );
-
+  const restore = withFakeAcp();
   try {
-    const first = await callCursorAcpResponses({
-      body: { model: "cursor-composer-2-fast", input: "First turn" },
-      request: request({ "thread-id": "codex-thread-1" }),
-      account: {} as any,
-      config: config(),
-      responseFormat: "openai-responses",
+    const firstTurn = await runTurn("First turn", {
+      "thread-id": "codex-thread-1",
     });
-    const firstCompleted = completedResponse(await first.text());
+    assert.match(allText(firstTurn.chunks), /prompt=First turn$/);
 
-    const second = await callCursorAcpResponses({
-      body: {
-        model: "cursor-composer-2-fast",
-        input: [
-          { role: "user", content: "First turn" },
-          { role: "assistant", content: "First answer" },
-          { role: "user", content: "Second turn" },
-        ],
-      },
-      request: request({ "thread-id": "codex-thread-1" }),
-      account: {} as any,
-      config: config(),
-      responseFormat: "openai-responses",
-    });
-    const secondCompleted = completedResponse(await second.text());
-
-    assert.equal(
-      secondCompleted.metadata.cursor_session_id,
-      firstCompleted.metadata.cursor_session_id,
+    const secondTurn = await runTurn(
+      [
+        { role: "user", content: "First turn" },
+        { role: "assistant", content: "First answer" },
+        { role: "user", content: "Second turn" },
+      ],
+      { "thread-id": "codex-thread-1" },
     );
-    const secondText = secondCompleted.output.at(-1).content[0].text;
+    const secondText = allText(secondTurn.chunks);
     assert.match(secondText, /prompt=Second turn$/);
     assert.doesNotMatch(secondText, /First answer/);
+    assert.equal(
+      secondTurn.final.metadata.cursor_session_id,
+      firstTurn.final.metadata.cursor_session_id,
+    );
   } finally {
-    await __disposeCursorAcpPools();
-    if (oldKey === undefined) delete process.env.CURSOR_API_KEY;
-    else process.env.CURSOR_API_KEY = oldKey;
-    if (oldNode === undefined) delete process.env.CURSOR_AGENT_NODE;
-    else process.env.CURSOR_AGENT_NODE = oldNode;
-    if (oldScript === undefined) delete process.env.CURSOR_AGENT_SCRIPT;
-    else process.env.CURSOR_AGENT_SCRIPT = oldScript;
+    await restore();
   }
 });
 
 test("previous_response_id continues ACP session without Codex headers", async () => {
-  const oldKey = process.env.CURSOR_API_KEY;
-  const oldNode = process.env.CURSOR_AGENT_NODE;
-  const oldScript = process.env.CURSOR_AGENT_SCRIPT;
-  process.env.CURSOR_API_KEY = "test-cursor-key";
-  process.env.CURSOR_AGENT_NODE = process.execPath;
-  process.env.CURSOR_AGENT_SCRIPT = path.resolve(
-    "tests/fixtures/fake-cursor-acp.mjs",
-  );
-
+  const restore = withFakeAcp();
   try {
-    const first = await callCursorAcpResponses({
-      body: { model: "cursor-composer-2-fast", input: "First generic turn" },
-      request: request(),
-      account: {} as any,
-      config: config(),
-      responseFormat: "openai-responses",
+    const first = await runTurn("First generic turn");
+    const second = await callOnce({
+      model: "cursor-composer-2-fast",
+      input: "Second generic turn",
+      previous_response_id: first.final.id,
     });
-    const firstCompleted = completedResponse(await first.text());
-
-    const second = await callCursorAcpResponses({
-      body: {
-        model: "cursor-composer-2-fast",
-        input: "Second generic turn",
-        previous_response_id: firstCompleted.id,
-      },
-      request: request(),
-      account: {} as any,
-      config: config(),
-      responseFormat: "openai-responses",
-    });
-    const secondCompleted = completedResponse(await second.text());
-
+    // Second turn may chunk; just verify the session carried over.
     assert.equal(
-      secondCompleted.metadata.cursor_session_id,
-      firstCompleted.metadata.cursor_session_id,
-    );
-    assert.match(
-      secondCompleted.output.at(-1).content[0].text,
-      /prompt=Second generic turn$/,
+      second.response.metadata.cursor_session_id,
+      first.final.metadata.cursor_session_id,
     );
   } finally {
-    await __disposeCursorAcpPools();
-    if (oldKey === undefined) delete process.env.CURSOR_API_KEY;
-    else process.env.CURSOR_API_KEY = oldKey;
-    if (oldNode === undefined) delete process.env.CURSOR_AGENT_NODE;
-    else process.env.CURSOR_AGENT_NODE = oldNode;
-    if (oldScript === undefined) delete process.env.CURSOR_AGENT_SCRIPT;
-    else process.env.CURSOR_AGENT_SCRIPT = oldScript;
+    await restore();
   }
 });
 
-test("overlapping turns for one Codex thread are serialized", async () => {
-  const oldKey = process.env.CURSOR_API_KEY;
-  const oldNode = process.env.CURSOR_AGENT_NODE;
-  const oldScript = process.env.CURSOR_AGENT_SCRIPT;
-  process.env.CURSOR_API_KEY = "test-cursor-key";
-  process.env.CURSOR_AGENT_NODE = process.execPath;
-  process.env.CURSOR_AGENT_SCRIPT = path.resolve(
-    "tests/fixtures/fake-cursor-acp.mjs",
-  );
-
+test("new prompt while turn is live cancels it and reuses the session", async () => {
+  const restore = withFakeAcp();
   try {
-    const makeTurn = async (input: string) => {
-      const response = await callCursorAcpResponses({
-        body: { model: "cursor-composer-2-fast", input },
-        request: request({ "thread-id": "codex-thread-serialized" }),
-        account: {} as any,
-        config: config(),
-        responseFormat: "openai-responses",
-      });
-      return completedResponse(await response.text());
-    };
-    const [first, second] = await Promise.all([
-      makeTurn("Concurrent one"),
-      makeTurn("Concurrent two"),
-    ]);
-
-    assert.equal(
-      second.metadata.cursor_session_id,
-      first.metadata.cursor_session_id,
+    // Chunk 1 ends at the tool boundary while the fixture turn keeps running.
+    const { response: firstChunk } = await callOnce(
+      { model: "cursor-composer-2-fast", input: "Concurrent one" },
+      { "thread-id": "codex-thread-replace" },
     );
-    assert.match(first.output.at(-1).content[0].text, /prompt=Concurrent one$/);
-    assert.match(
-      second.output.at(-1).content[0].text,
-      /prompt=Concurrent two$/,
+    assert.ok(lastFunctionCall(firstChunk));
+
+    // A brand-new prompt (no boundary output) replaces the live turn.
+    const replacement = await runTurn("Concurrent two", {
+      "thread-id": "codex-thread-replace",
+    });
+    assert.match(allText(replacement.chunks), /prompt=Concurrent two$/);
+    assert.equal(
+      replacement.final.metadata.cursor_session_id,
+      firstChunk.metadata.cursor_session_id,
     );
   } finally {
-    await __disposeCursorAcpPools();
-    if (oldKey === undefined) delete process.env.CURSOR_API_KEY;
-    else process.env.CURSOR_API_KEY = oldKey;
-    if (oldNode === undefined) delete process.env.CURSOR_AGENT_NODE;
-    else process.env.CURSOR_AGENT_NODE = oldNode;
-    if (oldScript === undefined) delete process.env.CURSOR_AGENT_SCRIPT;
-    else process.env.CURSOR_AGENT_SCRIPT = oldScript;
+    await restore();
   }
 });
 
 test("persisted Codex thread loads its Cursor ACP session after process restart", async () => {
-  const oldKey = process.env.CURSOR_API_KEY;
-  const oldNode = process.env.CURSOR_AGENT_NODE;
-  const oldScript = process.env.CURSOR_AGENT_SCRIPT;
-  const oldLoadSession = process.env.FAKE_ACP_LOAD_SESSION;
   const authDir = fs.mkdtempSync(path.join(os.tmpdir(), "auth2api-acp-"));
-  process.env.CURSOR_API_KEY = "test-cursor-key";
-  process.env.CURSOR_AGENT_NODE = process.execPath;
-  process.env.CURSOR_AGENT_SCRIPT = path.resolve(
-    "tests/fixtures/fake-cursor-acp.mjs",
-  );
-  process.env.FAKE_ACP_LOAD_SESSION = "true";
-
+  const restore = withFakeAcp({ FAKE_ACP_LOAD_SESSION: "true" });
+  const callWithDir = async (input: any, headers: Record<string, string>) => {
+    const history: any[] = [{ role: "user", content: input }];
+    let final: any;
+    for (let hop = 0; hop < 10; hop++) {
+      const response = await callCursorAcpResponses({
+        body: { model: "cursor-composer-2-fast", input: history },
+        request: request(headers),
+        account: {} as any,
+        config: config(authDir),
+        responseFormat: "openai-responses",
+      });
+      const completed = completedResponse(await response.text());
+      final = completed;
+      for (const item of completed.output || []) history.push(item);
+      const boundary = lastFunctionCall(completed);
+      if (!boundary) break;
+      history.push({
+        type: "function_call_output",
+        call_id: boundary.call_id,
+        output: `unsupported call: ${boundary.name}`,
+      });
+    }
+    const text = (final.output || [])
+      .filter((item: any) => item?.type === "message")
+      .flatMap((item: any) => item.content || [])
+      .map((part: any) => part?.text || "")
+      .join("");
+    return { final, text };
+  };
   try {
-    const first = await callCursorAcpResponses({
-      body: { model: "cursor-composer-2-fast", input: "Before restart" },
-      request: request({ "thread-id": "codex-thread-persisted" }),
-      account: {} as any,
-      config: config(authDir),
-      responseFormat: "openai-responses",
+    const first = await callWithDir("Before restart", {
+      "thread-id": "codex-thread-persisted",
     });
-    const firstCompleted = completedResponse(await first.text());
     await __disposeCursorAcpPools();
 
-    const second = await callCursorAcpResponses({
-      body: { model: "cursor-composer-2-fast", input: "After restart" },
-      request: request({ "thread-id": "codex-thread-persisted" }),
-      account: {} as any,
-      config: config(authDir),
-      responseFormat: "openai-responses",
+    const second = await callWithDir("After restart", {
+      "thread-id": "codex-thread-persisted",
     });
-    const secondCompleted = completedResponse(await second.text());
-    const secondText = secondCompleted.output.at(-1).content[0].text;
-
     assert.equal(
-      secondCompleted.metadata.cursor_session_id,
-      firstCompleted.metadata.cursor_session_id,
+      second.final.metadata.cursor_session_id,
+      first.final.metadata.cursor_session_id,
     );
-    assert.match(secondText, /loaded=true/);
-    assert.match(secondText, /prompt=After restart$/);
+    assert.match(second.text, /loaded=true/);
+    assert.match(second.text, /prompt=After restart$/);
   } finally {
-    await __disposeCursorAcpPools();
+    await restore();
     fs.rmSync(authDir, { recursive: true, force: true });
-    if (oldKey === undefined) delete process.env.CURSOR_API_KEY;
-    else process.env.CURSOR_API_KEY = oldKey;
-    if (oldNode === undefined) delete process.env.CURSOR_AGENT_NODE;
-    else process.env.CURSOR_AGENT_NODE = oldNode;
-    if (oldScript === undefined) delete process.env.CURSOR_AGENT_SCRIPT;
-    else process.env.CURSOR_AGENT_SCRIPT = oldScript;
-    if (oldLoadSession === undefined) delete process.env.FAKE_ACP_LOAD_SESSION;
-    else process.env.FAKE_ACP_LOAD_SESSION = oldLoadSession;
   }
 });

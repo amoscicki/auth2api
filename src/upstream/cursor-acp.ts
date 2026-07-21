@@ -6,6 +6,7 @@ import type { SessionNotification } from "@agentclientprotocol/sdk";
 
 import { CallCursorResponsesOptions } from "./cursor-api";
 import { __resolveCursorModel } from "./cursor-api";
+import { randomQuip } from "./cursor-acp-quips";
 
 const encoder = new TextEncoder();
 
@@ -247,7 +248,13 @@ class CursorAcpConnection {
 
   onSession(sessionId: string, handler: UpdateHandler): () => void {
     this.sessions.set(sessionId, handler);
-    return () => this.sessions.delete(sessionId);
+    return () => {
+      // A newer turn may have replaced the handler for this session already
+      // (steer = cancel -> prompt on the same session); never remove it.
+      if (this.sessions.get(sessionId) === handler) {
+        this.sessions.delete(sessionId);
+      }
+    };
   }
 
   private fail(error: Error): void {
@@ -279,6 +286,115 @@ class CursorAcpConnection {
   }
 }
 
+// ---------------------------------------------------------------------------
+// TurnRun: one live ACP session/prompt turn, decoupled from HTTP responses.
+// The turn accumulates segments; each HTTP response streams a chunk of them,
+// cutting at tool-call boundaries so Codex can persist the tool call in its
+// history and deliver steer input between chunks.
+// ---------------------------------------------------------------------------
+
+type Segment =
+  | { kind: "reasoning"; text: string }
+  | { kind: "text"; text: string }
+  | { kind: "tool_call"; callId: string; name: string; args: string }
+  | { kind: "end"; error?: Error; cancelled?: boolean };
+
+function sanitizeId(value: string): string {
+  return value.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 96);
+}
+
+function excerpt(value: unknown, max = 600): string {
+  if (value === undefined || value === null) return "";
+  const text =
+    typeof value === "string" ? value : JSON.stringify(value, null, 0);
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+class TurnRun {
+  readonly id = randomUUID();
+  segments: Segment[] = [];
+  cursor = 0;
+  running = true;
+  /** function_call call_ids emitted at chunk boundaries, awaiting follow-up. */
+  boundaryCallIds = new Set<string>();
+  /** ACP toolCallId -> emitted function name (for tool_call_update notes). */
+  toolNames = new Map<string, string>();
+  consumerAttached = false;
+  updatedAt = Date.now();
+  /** Resolves when the underlying session/prompt settles (end segment). */
+  readonly finished: Promise<void>;
+  private finishResolve!: () => void;
+  private waiters: Array<() => void> = [];
+  private abandonTimer?: NodeJS.Timeout;
+
+  constructor(
+    readonly conversation: CursorAcpConversation,
+    readonly connection: CursorAcpConnection,
+    readonly sessionId: string,
+  ) {
+    this.finished = new Promise((resolve) => {
+      this.finishResolve = resolve;
+    });
+  }
+
+  push(segment: Segment): void {
+    this.updatedAt = Date.now();
+    if (segment.kind === "end") {
+      this.running = false;
+      this.finishResolve();
+    }
+    this.segments.push(segment);
+    const waiters = this.waiters;
+    this.waiters = [];
+    for (const wake of waiters) wake();
+  }
+
+  /** Resolves when a new segment arrives or timeoutMs elapses. */
+  waitForSegment(timeoutMs: number): Promise<"segment" | "timeout"> {
+    if (this.cursor < this.segments.length || !this.running) {
+      return Promise.resolve("segment");
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve("timeout"), timeoutMs);
+      timer.unref();
+      this.waiters.push(() => {
+        clearTimeout(timer);
+        resolve("segment");
+      });
+    });
+  }
+
+  get drained(): boolean {
+    return this.cursor >= this.segments.length;
+  }
+
+  cancel(): void {
+    if (!this.running) return;
+    try {
+      this.connection.notify("session/cancel", { sessionId: this.sessionId });
+    } catch {
+      // Connection loss will surface through the prompt promise.
+    }
+  }
+
+  /** Arm/disarm the abandonment TTL (Codex never came back for a follow-up). */
+  armAbandonTimer(ttlMs: number, onAbandon: () => void): void {
+    this.clearAbandonTimer();
+    this.abandonTimer = setTimeout(() => {
+      if (!this.consumerAttached) onAbandon();
+    }, ttlMs);
+    this.abandonTimer.unref();
+  }
+
+  clearAbandonTimer(): void {
+    if (this.abandonTimer) clearTimeout(this.abandonTimer);
+    this.abandonTimer = undefined;
+  }
+}
+
+const ABANDONED_TURN_TTL_MS = 5 * 60 * 1000;
+const QUIP_INTERVAL_MS = 20_000;
+
 const pools = new Map<string, Promise<CursorAcpConnection>>();
 
 type CursorAcpConversation = {
@@ -288,6 +404,7 @@ type CursorAcpConversation = {
   statePath?: string;
   connection?: CursorAcpConnection;
   sessionId?: string;
+  activeTurn?: TurnRun;
   tail: Promise<void>;
   updatedAt: number;
 };
@@ -478,26 +595,6 @@ function getConversation(
   return conversation;
 }
 
-async function withConversationTurn<T>(
-  conversation: CursorAcpConversation,
-  turn: () => Promise<T>,
-): Promise<T> {
-  const previous = conversation.tail;
-  let release!: () => void;
-  conversation.tail = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  await previous;
-  try {
-    conversation.updatedAt = Date.now();
-    return await turn();
-  } finally {
-    conversation.updatedAt = Date.now();
-    persistConversation(conversation);
-    release();
-  }
-}
-
 function continuationPrompt(body: any): string {
   const input = body?.input ?? body?.messages;
   if (typeof input === "string") return input || "Continue.";
@@ -507,11 +604,10 @@ function continuationPrompt(body: any): string {
       if (typeof item === "string") return item;
       const role = String(item?.role || "").toLowerCase();
       const type = String(item?.type || "").toLowerCase();
-      if (role === "user" || type === "function_call_output") {
-        const text =
-          contentText(item?.content) ||
-          contentText(item?.output) ||
-          contentText(item?.text);
+      // Only user text starts a new Cursor turn. Synthetic boundary outputs
+      // ("unsupported call: cursor_*") must never become a prompt.
+      if (role === "user" && type !== "function_call_output") {
+        const text = contentText(item?.content) || contentText(item?.text);
         if (text) return text;
       }
     }
@@ -585,16 +681,6 @@ export function cancelCursorAcpResponse(responseId: string): boolean {
   return true;
 }
 
-export function steerCursorAcpResponse(
-  responseId: string,
-): { model: string } | undefined {
-  const stored = getCursorAcpResponse(responseId);
-  const conversation = responseConversations.get(responseId);
-  if (stored?.status !== "in_progress" || !conversation) return undefined;
-  if (!cancelCursorAcpResponse(responseId)) return undefined;
-  return { model: `cursor-${conversation.model}` };
-}
-
 async function getConnection(model: string): Promise<CursorAcpConnection> {
   let connection = pools.get(model);
   if (!connection) {
@@ -622,6 +708,158 @@ export async function __disposeCursorAcpPools(): Promise<void> {
     connections.map(async (value) => (await value).dispose()),
   );
 }
+
+// ---------------------------------------------------------------------------
+// Request classification: new turn vs continuation vs steer.
+// Codex resends full history each request. A follow-up after one of our
+// synthetic tool-call boundaries contains function_call_output items with our
+// call_ids ("unsupported call: ..."). Any user message AFTER the last such
+// item is steer input delivered by Codex between sampling requests.
+// ---------------------------------------------------------------------------
+
+type RequestClass =
+  | { kind: "new" }
+  | { kind: "continuation"; turn: TurnRun }
+  | { kind: "steer"; turn: TurnRun; steerText: string };
+
+function classifyRequest(body: any, turn: TurnRun | undefined): RequestClass {
+  if (!turn) return { kind: "new" };
+  const input = body?.input ?? body?.messages;
+  if (!Array.isArray(input)) return { kind: "new" };
+  let lastBoundaryIndex = -1;
+  for (let index = input.length - 1; index >= 0; index--) {
+    const item = input[index];
+    if (
+      item?.type === "function_call_output" &&
+      turn.boundaryCallIds.has(String(item?.call_id || ""))
+    ) {
+      lastBoundaryIndex = index;
+      break;
+    }
+  }
+  if (lastBoundaryIndex < 0) return { kind: "new" };
+  const steerParts: string[] = [];
+  for (let index = lastBoundaryIndex + 1; index < input.length; index++) {
+    const item = input[index];
+    const role = String(item?.role || "").toLowerCase();
+    if (item?.type === "function_call_output") continue;
+    if (role === "user" || item?.type === "message") {
+      const text = contentText(item?.content);
+      if (text) steerParts.push(text);
+    }
+  }
+  if (steerParts.length > 0) {
+    return { kind: "steer", turn, steerText: steerParts.join("\n\n") };
+  }
+  return { kind: "continuation", turn };
+}
+
+function segmentFromUpdate(
+  turn: TurnRun,
+  update: SessionNotification["update"],
+): Segment | undefined {
+  const type = (update as any).sessionUpdate;
+  const u = update as any;
+  if (type === "agent_message_chunk" && u.content?.type === "text") {
+    return { kind: "text", text: String(u.content.text || "") };
+  }
+  if (type === "agent_thought_chunk" && u.content?.type === "text") {
+    return { kind: "reasoning", text: String(u.content.text || "") };
+  }
+  if (type === "plan") {
+    return {
+      kind: "reasoning",
+      text: `\n[plan] ${excerpt(u.entries || [], 400)}\n`,
+    };
+  }
+  if (type === "tool_call") {
+    const name = `cursor_${sanitizeId(String(u.kind || "other"))}`;
+    const callId = `call_cursor_${sanitizeId(String(u.toolCallId || randomUUID()))}`;
+    turn.toolNames.set(String(u.toolCallId || ""), name);
+    return {
+      kind: "tool_call",
+      callId,
+      name,
+      args: JSON.stringify({
+        title: u.title || undefined,
+        input: u.rawInput ?? undefined,
+        locations: u.locations?.length ? u.locations : undefined,
+      }),
+    };
+  }
+  if (type === "tool_call_update") {
+    const name =
+      turn.toolNames.get(String(u.toolCallId || "")) || "cursor_tool";
+    const status = String(u.status || "updated");
+    const output = excerpt(u.rawOutput ?? contentText(u.content));
+    return {
+      kind: "reasoning",
+      text: `\n[${name} ${status}]${output ? ` ${output}` : ""}\n`,
+    };
+  }
+  if (type === "permission_request") {
+    return {
+      kind: "reasoning",
+      text: `\n[permission auto-allowed] ${excerpt(u.request?.toolCall?.title || "", 200)}\n`,
+    };
+  }
+  return undefined;
+}
+
+function abandonTurn(conversation: CursorAcpConversation, turn: TurnRun) {
+  turn.cancel();
+  if (conversation.activeTurn === turn) conversation.activeTurn = undefined;
+}
+
+async function startTurn(
+  conversation: CursorAcpConversation,
+  model: string,
+  prompt: string,
+): Promise<TurnRun> {
+  const connection = await getConnection(model);
+  const session = await ensureConversationSession(conversation, connection);
+  const turn = new TurnRun(conversation, connection, session.sessionId);
+  conversation.activeTurn = turn;
+  const stopSession = connection.onSession(session.sessionId, (update) => {
+    const segment = segmentFromUpdate(turn, update);
+    if (segment) turn.push(segment);
+  });
+  connection
+    .request(
+      "session/prompt",
+      {
+        sessionId: session.sessionId,
+        prompt: [{ type: "text", text: prompt }],
+      },
+      0,
+    )
+    .then((result: any) => {
+      turn.push({
+        kind: "end",
+        cancelled: result?.stopReason === "cancelled",
+      });
+    })
+    .catch((error: unknown) => {
+      turn.push({
+        kind: "end",
+        error: error instanceof Error ? error : new Error(String(error)),
+      });
+    })
+    .finally(() => {
+      stopSession();
+      conversation.updatedAt = Date.now();
+      persistConversation(conversation);
+      if (conversation.activeTurn === turn && !turn.running && turn.drained) {
+        conversation.activeTurn = undefined;
+      }
+    });
+  return turn;
+}
+
+// ---------------------------------------------------------------------------
+// Chunk writer: streams segments from a TurnRun into one Responses SSE
+// response, ending the response at a tool_call boundary or at turn end.
+// ---------------------------------------------------------------------------
 
 export async function callCursorAcpResponses(
   options: CallCursorResponsesOptions,
@@ -653,8 +891,6 @@ export async function callCursorAcpResponses(
     options.config.cloaking.cursor?.["heartbeat-ms"] ?? 15_000;
   const idleTimeoutMs = options.config.timeouts["stream-messages-ms"];
   const responseId = `resp_cursor_${randomUUID()}`;
-  const messageId = `msg_cursor_${randomUUID()}`;
-  const reasoningId = `rs_cursor_${randomUUID()}`;
   const createdAt = Math.floor(Date.now() / 1000);
   const conversation = getConversation(options, model, workspace, responseId);
   responseStore.set(responseId, {
@@ -666,19 +902,19 @@ export async function callCursorAcpResponses(
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      let connection: CursorAcpConnection | undefined;
-      let sessionId: string | undefined;
       let sequence = 0;
-      let fullText = "";
-      let fullReasoning = "";
-      let reasoningStarted = false;
-      let reasoningOutputIndex = 0;
-      let messageStarted = false;
-      let messageOutputIndex = 0;
       let completed = false;
-      let idleTimer: NodeJS.Timeout;
-      let stopSession = () => {};
+      let turn: TurnRun | undefined;
       const output: any[] = [];
+      let nextOutputIndex = 0;
+      // Open item state: at most one reasoning and one message item open at a
+      // time; a new one opens (with a fresh id/index) after the other kind
+      // interleaves.
+      let openReasoning:
+        | { id: string; index: number; text: string }
+        | undefined;
+      let openMessage: { id: string; index: number; text: string } | undefined;
+
       const write = (value: string) => {
         if (consumerClosed) return;
         try {
@@ -689,224 +925,220 @@ export async function callCursorAcpResponses(
       };
       const emit = (name: string, data: JsonObject) =>
         write(sse(name, { type: name, sequence_number: sequence++, ...data }));
-      const ensureReasoning = () => {
-        if (reasoningStarted) return;
-        reasoningStarted = true;
-        reasoningOutputIndex = messageStarted ? 1 : 0;
-        emit("response.output_item.added", {
-          output_index: reasoningOutputIndex,
-          item: {
-            id: reasoningId,
-            type: "reasoning",
-            status: "in_progress",
-            summary: [],
-          },
-        });
-        emit("response.reasoning_summary_part.added", {
-          item_id: reasoningId,
-          output_index: reasoningOutputIndex,
+
+      const closeReasoning = () => {
+        if (!openReasoning) return;
+        emit("response.reasoning_summary_text.done", {
+          item_id: openReasoning.id,
+          output_index: openReasoning.index,
           summary_index: 0,
-          part: { type: "summary_text", text: "" },
+          text: openReasoning.text,
         });
+        emit("response.reasoning_summary_part.done", {
+          item_id: openReasoning.id,
+          output_index: openReasoning.index,
+          summary_index: 0,
+          part: { type: "summary_text", text: openReasoning.text },
+        });
+        const item = {
+          id: openReasoning.id,
+          type: "reasoning",
+          status: "completed",
+          summary: [{ type: "summary_text", text: openReasoning.text }],
+        };
+        emit("response.output_item.done", {
+          output_index: openReasoning.index,
+          item,
+        });
+        output[openReasoning.index] = item;
+        openReasoning = undefined;
+      };
+      const closeMessage = () => {
+        if (!openMessage) return;
+        const item = {
+          id: openMessage.id,
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [
+            { type: "output_text", text: openMessage.text, annotations: [] },
+          ],
+        };
+        emit("response.output_text.done", {
+          item_id: openMessage.id,
+          output_index: openMessage.index,
+          content_index: 0,
+          text: openMessage.text,
+        });
+        emit("response.output_item.done", {
+          output_index: openMessage.index,
+          item,
+        });
+        output[openMessage.index] = item;
+        openMessage = undefined;
       };
       const emitReasoning = (delta: string) => {
         if (!delta) return;
-        ensureReasoning();
-        fullReasoning += delta;
+        if (!openReasoning) {
+          closeMessage();
+          openReasoning = {
+            id: `rs_cursor_${randomUUID()}`,
+            index: nextOutputIndex++,
+            text: "",
+          };
+          emit("response.output_item.added", {
+            output_index: openReasoning.index,
+            item: {
+              id: openReasoning.id,
+              type: "reasoning",
+              status: "in_progress",
+              summary: [],
+            },
+          });
+          emit("response.reasoning_summary_part.added", {
+            item_id: openReasoning.id,
+            output_index: openReasoning.index,
+            summary_index: 0,
+            part: { type: "summary_text", text: "" },
+          });
+        }
+        openReasoning.text += delta;
         emit("response.reasoning_summary_text.delta", {
-          item_id: reasoningId,
-          output_index: reasoningOutputIndex,
+          item_id: openReasoning.id,
+          output_index: openReasoning.index,
           summary_index: 0,
           delta,
         });
       };
-      const ensureMessage = () => {
-        if (messageStarted) return;
-        messageStarted = true;
-        messageOutputIndex = reasoningStarted ? 1 : 0;
-        emit("response.output_item.added", {
-          output_index: messageOutputIndex,
-          item: {
-            id: messageId,
-            type: "message",
-            status: "in_progress",
-            role: "assistant",
-            content: [],
-          },
-        });
-        emit("response.content_part.added", {
-          item_id: messageId,
-          output_index: messageOutputIndex,
-          content_index: 0,
-          part: { type: "output_text", text: "", annotations: [] },
-        });
-      };
-      const resetIdle = () => {
-        clearTimeout(idleTimer);
-        idleTimer = setTimeout(
-          () =>
-            finish(
-              new Error(
-                `cursor-agent ACP idle timeout after ${idleTimeoutMs}ms`,
-              ),
-            ),
-          idleTimeoutMs,
-        );
-        idleTimer.unref();
-      };
-      const handleUpdate: UpdateHandler = (update) => {
-        resetIdle();
-        const stored = responseStore.get(responseId);
-        if (stored) stored.updated_at = Date.now();
-        const type = update.sessionUpdate;
-        if (type === "agent_message_chunk" && update.content?.type === "text") {
-          ensureMessage();
-          const delta = String(update.content.text || "");
-          fullText += delta;
-          emit("response.output_text.delta", {
-            item_id: messageId,
-            output_index: messageOutputIndex,
+      const emitText = (delta: string) => {
+        if (!delta) return;
+        if (!openMessage) {
+          closeReasoning();
+          openMessage = {
+            id: `msg_cursor_${randomUUID()}`,
+            index: nextOutputIndex++,
+            text: "",
+          };
+          emit("response.output_item.added", {
+            output_index: openMessage.index,
+            item: {
+              id: openMessage.id,
+              type: "message",
+              status: "in_progress",
+              role: "assistant",
+              content: [],
+            },
+          });
+          emit("response.content_part.added", {
+            item_id: openMessage.id,
+            output_index: openMessage.index,
             content_index: 0,
-            delta,
-          });
-        } else if (
-          type === "agent_thought_chunk" &&
-          update.content?.type === "text"
-        ) {
-          emitReasoning(String(update.content.text || ""));
-        } else if (type === "plan") {
-          emit("response.cursor.plan", { session_id: sessionId, ...update });
-          emitReasoning(`[plan] ${JSON.stringify(update.entries || [])}\n`);
-        } else if (type === "tool_call") {
-          emit("response.cursor.tool_call", {
-            session_id: sessionId,
-            ...update,
-          });
-          emitReasoning(
-            `[tool:${update.kind || "other"}] ${update.title || update.toolCallId} (${update.status || "pending"})\n`,
-          );
-        } else if (type === "tool_call_update") {
-          emit("response.cursor.tool_call_update", {
-            session_id: sessionId,
-            ...update,
-          });
-          emitReasoning(
-            `[tool:${update.toolCallId}] ${update.status || "updated"}\n`,
-          );
-        } else {
-          emit("response.cursor.session_update", {
-            session_id: sessionId,
-            ...update,
+            part: { type: "output_text", text: "", annotations: [] },
           });
         }
+        openMessage.text += delta;
+        emit("response.output_text.delta", {
+          item_id: openMessage.id,
+          output_index: openMessage.index,
+          content_index: 0,
+          delta,
+        });
       };
+
       const heartbeat = setInterval(() => write(": ping\n\n"), heartbeatMs);
       heartbeat.unref();
 
       const cleanup = () => {
         clearInterval(heartbeat);
-        clearTimeout(idleTimer);
-        stopSession();
         activeResponses.delete(responseId);
+        if (turn) {
+          turn.consumerAttached = false;
+          if (turn.running || !turn.drained) {
+            const current = turn;
+            turn.armAbandonTimer(ABANDONED_TURN_TTL_MS, () =>
+              abandonTurn(conversation, current),
+            );
+          }
+        }
       };
-      const finish = (error?: Error) => {
+
+      const finalize = (
+        status: "completed" | "failed" | "cancelled",
+        error?: Error,
+        extraMetadata?: JsonObject,
+      ) => {
         if (completed) return;
         completed = true;
+        closeReasoning();
+        closeMessage();
         cleanup();
-        if (error) {
-          const cancelled = error.name === "CursorAcpCancelledError";
-          if (!cancelled && connection && sessionId) {
-            try {
-              connection.notify("session/cancel", { sessionId });
-            } catch {
-              // Connection failure already explains the terminal response.
-            }
-          }
-          const failedResponse = {
-            id: responseId,
-            object: "response",
-            created_at: createdAt,
-            status: cancelled ? "cancelled" : "failed",
-            model,
-            output,
-            error: cancelled
-              ? null
-              : { code: "cursor_acp_error", message: error.message },
-          };
-          responseStore.set(responseId, {
-            id: responseId,
-            status: cancelled ? "cancelled" : "failed",
-            response: failedResponse,
-            updated_at: Date.now(),
-          });
-          emit(cancelled ? "response.cancelled" : "response.failed", {
-            response: failedResponse,
-          });
-          if (!consumerClosed) controller.close();
-          return;
-        }
-        if (reasoningStarted) {
-          emit("response.reasoning_summary_text.done", {
-            item_id: reasoningId,
-            output_index: reasoningOutputIndex,
-            summary_index: 0,
-            text: fullReasoning,
-          });
-          emit("response.reasoning_summary_part.done", {
-            item_id: reasoningId,
-            output_index: reasoningOutputIndex,
-            summary_index: 0,
-            part: { type: "summary_text", text: fullReasoning },
-          });
-          const reasoning = {
-            id: reasoningId,
-            type: "reasoning",
-            status: "completed",
-            summary: [{ type: "summary_text", text: fullReasoning }],
-          };
-          emit("response.output_item.done", {
-            output_index: reasoningOutputIndex,
-            item: reasoning,
-          });
-          output[reasoningOutputIndex] = reasoning;
-        }
-        ensureMessage();
-        const message = {
-          id: messageId,
-          type: "message",
-          status: "completed",
-          role: "assistant",
-          content: [{ type: "output_text", text: fullText, annotations: [] }],
-        };
-        emit("response.output_text.done", {
-          item_id: messageId,
-          output_index: messageOutputIndex,
-          content_index: 0,
-          text: fullText,
-        });
-        emit("response.output_item.done", {
-          output_index: messageOutputIndex,
-          item: message,
-        });
-        output[messageOutputIndex] = message;
-        const completedResponse = {
+        const response: JsonObject = {
           id: responseId,
           object: "response",
           created_at: createdAt,
-          status: "completed",
+          status,
           model,
           output,
           usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
-          metadata: sessionId ? { cursor_session_id: sessionId } : {},
+          metadata: {
+            ...(turn?.sessionId ? { cursor_session_id: turn.sessionId } : {}),
+            ...(extraMetadata || {}),
+          },
         };
+        if (status === "failed") {
+          response.error = {
+            code: "cursor_acp_error",
+            message: error?.message || "Cursor ACP turn failed",
+          };
+        }
         responseStore.set(responseId, {
           id: responseId,
-          status: "completed",
-          response: completedResponse,
+          status,
+          response,
           updated_at: Date.now(),
         });
-        emit("response.completed", { response: completedResponse });
-        if (!consumerClosed) controller.close();
+        emit(
+          status === "completed"
+            ? "response.completed"
+            : status === "cancelled"
+              ? "response.cancelled"
+              : "response.failed",
+          { response },
+        );
+        if (!consumerClosed) {
+          try {
+            controller.close();
+          } catch {
+            consumerClosed = true;
+          }
+        }
+      };
+
+      /** Ends this chunk at a tool boundary: function_call item + completed. */
+      const finalizeAtToolCall = (segment: {
+        callId: string;
+        name: string;
+        args: string;
+      }) => {
+        closeReasoning();
+        closeMessage();
+        const index = nextOutputIndex++;
+        const item = {
+          id: `fc_${segment.callId}`,
+          type: "function_call",
+          call_id: segment.callId,
+          name: segment.name,
+          arguments: segment.args,
+          status: "completed",
+        };
+        emit("response.output_item.added", {
+          output_index: index,
+          item: { ...item, status: "in_progress" },
+        });
+        emit("response.output_item.done", { output_index: index, item });
+        output[index] = item;
+        turn?.boundaryCallIds.add(segment.callId);
+        finalize("completed");
       };
 
       emit("response.created", {
@@ -921,55 +1153,129 @@ export async function callCursorAcpResponses(
         },
       });
       activeResponses.set(responseId, () => {
-        if (connection && sessionId) {
-          try {
-            connection.notify("session/cancel", { sessionId });
-          } catch {
-            // Cancellation still transitions local response state.
+        const current = turn;
+        if (current) {
+          current.cancel();
+          if (conversation.activeTurn === current) {
+            conversation.activeTurn = undefined;
           }
         }
-        const error = new Error("Cursor ACP response cancelled");
-        error.name = "CursorAcpCancelledError";
-        finish(error);
+        finalize("cancelled");
       });
+
       void (async () => {
         try {
-          await withConversationTurn(conversation, async () => {
-            connection = await getConnection(model);
+          const existing = conversation.activeTurn;
+          const classified = classifyRequest(body, existing);
+          console.log(
+            `[cursor-acp] request classified=${classified.kind} activeTurn=${Boolean(existing)} inputItems=${Array.isArray(body?.input) ? body.input.length : typeof body?.input}`,
+          );
+
+          if (classified.kind === "continuation") {
+            turn = classified.turn;
+          } else {
+            if (existing) {
+              // New prompt or steer while a turn is live: cancel -> send on
+              // the same ACP session (approved steer semantics). Wait for the
+              // old session/prompt to actually settle before prompting again,
+              // otherwise cursor-agent drops or serializes the new prompt
+              // unpredictably.
+              existing.cancel();
+              existing.clearAbandonTimer();
+              conversation.activeTurn = undefined;
+              const settled = await Promise.race([
+                existing.finished.then(() => true),
+                new Promise<false>((resolve) => {
+                  const timer = setTimeout(() => resolve(false), 15_000);
+                  timer.unref();
+                }),
+              ]);
+              if (!settled) {
+                console.warn(
+                  "[cursor-acp] previous turn did not settle after cancel; prompting anyway",
+                );
+              }
+            }
+            const isNewSession = !conversation.sessionId;
+            const prompt =
+              classified.kind === "steer"
+                ? classified.steerText
+                : isNewSession
+                  ? promptFromBody(body)
+                  : continuationPrompt(body);
+            turn = await startTurn(conversation, model, prompt);
+          }
+          if (completed) return;
+          turn.consumerAttached = true;
+          turn.clearAbandonTimer();
+
+          let idleElapsed = 0;
+          for (;;) {
             if (completed) return;
-            const session = await ensureConversationSession(
-              conversation,
-              connection,
+            if (turn.cursor < turn.segments.length) {
+              const segment = turn.segments[turn.cursor++];
+              idleElapsed = 0;
+              if (segment.kind === "reasoning") emitReasoning(segment.text);
+              else if (segment.kind === "text") emitText(segment.text);
+              else if (segment.kind === "tool_call") {
+                finalizeAtToolCall(segment);
+                return;
+              } else {
+                // end
+                if (conversation.activeTurn === turn) {
+                  conversation.activeTurn = undefined;
+                }
+                if (segment.error) finalize("failed", segment.error);
+                else {
+                  finalize("completed", undefined, {
+                    cursor_stop_reason: segment.cancelled
+                      ? "cancelled"
+                      : "end_turn",
+                  });
+                }
+                return;
+              }
+              continue;
+            }
+            if (!turn.running) {
+              // Drained and ended without an explicit end segment (should not
+              // happen, but never hang).
+              if (conversation.activeTurn === turn) {
+                conversation.activeTurn = undefined;
+              }
+              finalize("completed");
+              return;
+            }
+            const waitMs = Math.min(
+              QUIP_INTERVAL_MS,
+              Math.max(idleTimeoutMs - idleElapsed, 50),
             );
-            if (completed) return;
-            sessionId = session.sessionId;
-            stopSession = connection.onSession(sessionId, handleUpdate);
-            resetIdle();
-            await connection.request(
-              "session/prompt",
-              {
-                sessionId,
-                prompt: [
-                  {
-                    type: "text",
-                    text: session.continued
-                      ? continuationPrompt(body)
-                      : promptFromBody(body),
-                  },
-                ],
-              },
-              0,
-            );
-          });
-          finish();
+            const waited = await turn.waitForSegment(waitMs);
+            if (waited === "timeout") {
+              idleElapsed += waitMs;
+              if (idleElapsed >= idleTimeoutMs) {
+                finalize(
+                  "failed",
+                  new Error(
+                    `cursor-agent ACP idle timeout after ${idleTimeoutMs}ms`,
+                  ),
+                );
+                return;
+              }
+              emitReasoning(`\n${randomQuip()}...\n`);
+            }
+          }
         } catch (error) {
-          finish(error instanceof Error ? error : new Error(String(error)));
+          finalize(
+            "failed",
+            error instanceof Error ? error : new Error(String(error)),
+          );
         }
       })();
     },
     cancel() {
-      // HTTP client disappeared. Keep ACP turn alive; caller can retrieve the
-      // completed response through GET /v1/responses/:id.
+      // HTTP client disappeared. Keep the ACP turn alive; Codex retries or the
+      // abandonment TTL reaps it.
       consumerClosed = true;
     },
   });
