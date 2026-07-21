@@ -37,6 +37,8 @@ export interface CloakingConfig {
     transport?: "cli" | "legacy";
     /** CLI execution mode. ask/plan are read-only; agent enables Cursor tools. */
     "agent-mode"?: "ask" | "plan" | "agent";
+    /** Pass --force (Run Everything): allow commands unless explicitly denied. */
+    force?: boolean;
     /** Workspace passed to cursor-agent. Defaults to auth2api process cwd. */
     workspace?: string;
     timezone?: string;

@@ -535,6 +535,7 @@ export async function callCursorCliResponses(
     model,
   ];
   if (mode !== "agent") args.push("--mode", mode);
+  if (options.config.cloaking.cursor?.force) args.push("--force");
 
   let child: ChildProcessWithoutNullStreams;
   try {
