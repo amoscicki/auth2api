@@ -2,11 +2,9 @@ import { PKCECodes, TokenData } from "../auth/types";
 import { loadAllTokens } from "../auth/token-storage";
 import { refreshCursorTokensWithRetry } from "../auth/cursor/oauth";
 import { AccountManager } from "../accounts/manager";
-import {
-  callCursorResponses,
-  listCursorModels,
-} from "../upstream/cursor-api";
+import { callCursorResponses, listCursorModels } from "../upstream/cursor-api";
 import { callCursorCliResponses } from "../upstream/cursor-cli";
+import { callCursorAcpResponses } from "../upstream/cursor-acp";
 import { Provider, UpstreamCallContext, ProviderOAuthInfo } from "./types";
 
 const CURSOR_OAUTH: ProviderOAuthInfo = {
@@ -40,7 +38,9 @@ export function buildCursorProvider(authDir: string): Provider {
       );
     },
     exchangeCode: async () => {
-      throw new Error("Cursor provider does not implement browser OAuth exchange");
+      throw new Error(
+        "Cursor provider does not implement browser OAuth exchange",
+      );
     },
     listModels: () => listCursorModels(manager),
     callMessages: (opts: UpstreamCallContext) => {
@@ -54,9 +54,15 @@ export function buildCursorProvider(authDir: string): Provider {
         : path.includes("/v1/chat/completions")
           ? "openai-chat-completions"
           : "openai-responses";
-      const transport = opts.config.cloaking.cursor?.transport || "cli";
+      const transport = opts.config.cloaking.cursor?.transport || "acp";
       const call =
-        transport === "legacy" ? callCursorResponses : callCursorCliResponses;
+        transport === "legacy"
+          ? callCursorResponses
+          : transport === "cli"
+            ? callCursorCliResponses
+            : responseFormat === "openai-responses"
+              ? callCursorAcpResponses
+              : callCursorCliResponses;
       return call({
         body: opts.body,
         request: opts.request,

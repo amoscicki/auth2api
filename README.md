@@ -84,7 +84,7 @@ You can run `--login` multiple times to add additional accounts (per provider). 
 
 > **Note on Codex:** The codex provider relays your ChatGPT Plus/Pro subscription quota. OpenAI's ToS does not officially permit relaying ChatGPT sessions through third-party tools — use this for your own personal local consumption only.
 
-> **Note on Cursor:** The default transport wraps the installed, current `cursor-agent` CLI and requires `CURSOR_API_KEY` in the server environment. The old reverse-engineered protobuf transport remains available as `cloaking.cursor.transport: legacy`.
+> **Note on Cursor:** The default `/v1/responses` transport keeps the installed `cursor-agent acp` process alive and requires `CURSOR_API_KEY` in the server environment. `transport: cli` keeps the older one-process-per-request bridge. The reverse-engineered protobuf transport remains available as `transport: legacy`.
 
 ## Starting the server
 
@@ -128,14 +128,14 @@ debug: "off" # off | errors | verbose
 - `errors`: log upstream/network failures and upstream error bodies
 - `verbose`: include `errors` logs plus per-request method, path, status, and duration
 
-Cursor defaults to the installed Agent CLI. `agent-mode: ask` keeps the nested Cursor agent read-only. Set a fixed workspace when needed. `agent-mode: agent` enables Cursor's own agent loop, not Codex function calls.
+Cursor `/v1/responses` defaults to persistent ACP. ACP runs Cursor in agent mode and automatically accepts its permission prompts, so point `workspace` at a disposable or otherwise trusted directory. `/v1/chat/completions` and `/v1/messages` keep using the CLI compatibility bridge. Set `transport: cli` to use that bridge everywhere, or `transport: legacy` for the old protobuf implementation.
 
 ```yaml
 cloaking:
   cursor:
-    transport: "cli"
-    agent-mode: "ask"
+    transport: "acp"
     workspace: "P:\\your-project"
+    heartbeat-ms: 15000
     client-version: "2.3.41"
     client-type: "ide"
     agent-base-url: "https://api2.cursor.sh"
@@ -254,7 +254,7 @@ When **more than one provider has accounts**, the historical routing table above
 | `POST /v1/messages`              | ✅        | ✅ (Anthropic ↔ Responses translator — see below)                   | ✅ (Anthropic Messages SSE — see below)                            |
 | `POST /v1/messages/count_tokens` | ✅        | ❌ (501)                                                            | ❌ (501)                                                           |
 
-For Cursor all three OpenAI-compatible endpoints are wired natively: `req.path` selects the wire format the cursor provider emits (`openai-chat-completions`, `openai-responses`, or `anthropic-messages`). Non-streaming `/v1/chat/completions` aggregates the upstream stream into a single `chat.completion` JSON response.
+For Cursor all three OpenAI-compatible endpoints remain wired: ACP serves `/v1/responses`; the CLI bridge serves Chat Completions and Anthropic Messages compatibility. Non-streaming `/v1/chat/completions` aggregates the upstream stream into a single `chat.completion` JSON response.
 
 For Codex (ChatGPT-account backend) the same coverage is achieved through a dedicated Chat ↔ Responses ↔ Anthropic translator pair (`src/upstream/responses-translator.ts`): incoming Chat or Anthropic requests are translated to OpenAI Responses upstream, the streaming Responses SSE response is translated back to the original wire format, and non-streaming requests aggregate the SSE locally before responding. Tool calls, system prompts (lifted into `instructions`), `reasoning_effort`/`thinking`, multi-turn conversations and `response_format` `json_schema` are all supported. Codex-specific incompatibilities (`max_output_tokens`, `parallel_tool_calls`) are stripped automatically in the codex handler — you don't have to think about them.
 
@@ -268,9 +268,11 @@ The ChatGPT codex backend rejects requests that don't include `stream: true`, `s
 
 Off-the-shelf OpenAI Responses / Chat / Claude Code clients all just work without knowing about codex's quirks.
 
-#### Cursor `/v1/responses` limitations
+#### Cursor ACP `/v1/responses`
 
-The CLI bridge translates Cursor Agent `stream-json` assistant deltas into OpenAI Responses SSE. Cursor CLI tool executions are internal to Cursor and are not translated into Codex `function_call` items. Default `agent-mode: ask` is therefore text-only and read-only. Images and Responses structured-output schemas are not translated.
+The ACP bridge starts one persistent Cursor process per selected model and creates a fresh ACP session per request. It translates assistant text and ACP thought chunks to standard Responses SSE. Plan and tool progress remain visible through `response.cursor.plan`, `response.cursor.tool_call`, `response.cursor.tool_call_update`, and `response.cursor.session_update` events. Heartbeat comments (`: ping`) keep quiet long-running turns connected.
+
+Client disconnect does not cancel Cursor. Save the response ID from `response.created`, then fetch `GET /v1/responses/:responseId`; in-progress results return `202`, terminal results return `200`. `POST /v1/responses/:responseId/cancel` sends ACP `session/cancel`. Results live in memory for one hour, so a proxy restart loses them. Images and Responses structured-output schemas are not translated.
 
 `transport: legacy` restores the old HTTP/2 + protobuf path for older Cursor deployments. Its previous single-turn text and version-gate limitations still apply.
 
@@ -280,6 +282,8 @@ The CLI bridge translates Cursor Agent `stream-json` assistant deltas into OpenA
 | -------------------------------- | --------------------------------------------------------------------- |
 | `POST /v1/chat/completions`      | OpenAI-compatible chat                                                |
 | `POST /v1/responses`             | OpenAI Responses API compatibility                                    |
+| `GET /v1/responses/:id`          | Fetch detached Cursor ACP result                                      |
+| `POST /v1/responses/:id/cancel`  | Cancel active Cursor ACP turn                                         |
 | `POST /v1/messages`              | Claude native passthrough                                             |
 | `POST /v1/messages/count_tokens` | Claude token counting                                                 |
 | `GET /v1/models`                 | List available models                                                 |

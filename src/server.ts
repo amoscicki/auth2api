@@ -13,6 +13,10 @@ import {
 } from "./handlers/anthropic";
 import { StatsRecorder } from "./stats/recorder";
 import { cursorCodexModelsAvailableIn } from "./upstream/cursor-model-registry";
+import {
+  cancelCursorAcpResponse,
+  getCursorAcpResponse,
+} from "./upstream/cursor-acp";
 
 // Simple in-memory rate limiter per IP
 const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
@@ -25,7 +29,9 @@ type ListedModel = {
   owned_by: string;
 };
 
-function codexPickerModels(data: ListedModel[]): Array<Record<string, unknown>> {
+function codexPickerModels(
+  data: ListedModel[],
+): Array<Record<string, unknown>> {
   const registered = cursorCodexModelsAvailableIn(
     data
       .filter((model) => model.owned_by === "cursor")
@@ -318,6 +324,40 @@ export function createServer(
     createChatCompletionsHandler(config, registry),
   );
   app.post("/v1/responses", createResponsesHandler(config, registry));
+  app.get("/v1/responses/:responseId", (req, res) => {
+    const stored = getCursorAcpResponse(req.params.responseId);
+    if (!stored) {
+      res.status(404).json({ error: { message: "Response not found" } });
+      return;
+    }
+    res.status(stored.status === "in_progress" ? 202 : 200).json(
+      stored.response || {
+        id: stored.id,
+        object: "response",
+        status: stored.status,
+      },
+    );
+  });
+  app.post("/v1/responses/:responseId/cancel", (req, res) => {
+    const stored = getCursorAcpResponse(req.params.responseId);
+    if (!stored) {
+      res.status(404).json({ error: { message: "Response not found" } });
+      return;
+    }
+    if (stored.status !== "in_progress") {
+      res
+        .status(409)
+        .json({ error: { message: `Response is ${stored.status}` } });
+      return;
+    }
+    if (!cancelCursorAcpResponse(req.params.responseId)) {
+      res
+        .status(409)
+        .json({ error: { message: "Response is no longer active" } });
+      return;
+    }
+    res.json(getCursorAcpResponse(req.params.responseId)?.response);
+  });
   app.post(
     "/v1/responses/compact",
     createResponsesCompactHandler(config, registry),
