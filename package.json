@@ -13,6 +13,7 @@
     "prettier": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\""
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "^1.2.1",
     "express": "^4.21.0",
     "js-yaml": "^4.1.0",
     "uuid": "^10.0.0"
