@@ -102,6 +102,7 @@ class CursorAcpConnection {
     }
   >();
   private sessions = new Map<string, UpdateHandler>();
+  private agentCapabilities: JsonObject = {};
 
   private constructor(private readonly model: string) {
     this.child = spawnAcp(model);
@@ -125,11 +126,12 @@ class CursorAcpConnection {
   static async create(model: string): Promise<CursorAcpConnection> {
     const connection = new CursorAcpConnection(model);
     try {
-      await connection.request("initialize", {
+      const initialized = await connection.request("initialize", {
         protocolVersion: 1,
         clientCapabilities: {},
         clientInfo: { name: "auth2api", version: "1.0.0" },
       });
+      connection.agentCapabilities = initialized?.agentCapabilities || {};
       return connection;
     } catch (error) {
       await connection.dispose();
@@ -267,9 +269,31 @@ class CursorAcpConnection {
   get isClosed(): boolean {
     return this.closed;
   }
+
+  get canLoadSession(): boolean {
+    return this.agentCapabilities.loadSession === true;
+  }
+
+  get canResumeSession(): boolean {
+    return this.agentCapabilities.sessionCapabilities?.resume === true;
+  }
 }
 
 const pools = new Map<string, Promise<CursorAcpConnection>>();
+
+type CursorAcpConversation = {
+  model: string;
+  workspace: string;
+  persistentKey?: string;
+  statePath?: string;
+  connection?: CursorAcpConnection;
+  sessionId?: string;
+  tail: Promise<void>;
+  updatedAt: number;
+};
+
+const conversations = new Map<string, CursorAcpConversation>();
+const responseConversations = new Map<string, CursorAcpConversation>();
 
 export type StoredCursorAcpResponse = {
   id: string;
@@ -281,6 +305,266 @@ export type StoredCursorAcpResponse = {
 const responseStore = new Map<string, StoredCursorAcpResponse>();
 const activeResponses = new Map<string, () => void>();
 const STORE_TTL_MS = 60 * 60 * 1000;
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+type PersistedSession = { sessionId: string; updatedAt: number };
+const persistedSessions = new Map<string, Map<string, PersistedSession>>();
+
+function loadPersistedSessions(
+  statePath: string,
+): Map<string, PersistedSession> {
+  const cached = persistedSessions.get(statePath);
+  if (cached) return cached;
+  const sessions = new Map<string, PersistedSession>();
+  try {
+    const parsed = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    for (const [key, value] of Object.entries(parsed?.sessions || {})) {
+      const session = value as Partial<PersistedSession>;
+      if (
+        typeof session.sessionId === "string" &&
+        typeof session.updatedAt === "number" &&
+        Date.now() - session.updatedAt <= SESSION_TTL_MS
+      ) {
+        sessions.set(key, {
+          sessionId: session.sessionId,
+          updatedAt: session.updatedAt,
+        });
+      }
+    }
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") {
+      console.error(
+        `[cursor-acp] Failed to read session state: ${error.message}`,
+      );
+    }
+  }
+  persistedSessions.set(statePath, sessions);
+  return sessions;
+}
+
+function persistConversation(conversation: CursorAcpConversation): void {
+  if (
+    !conversation.persistentKey ||
+    !conversation.statePath ||
+    !conversation.sessionId
+  ) {
+    return;
+  }
+  const sessions = loadPersistedSessions(conversation.statePath);
+  sessions.set(conversation.persistentKey, {
+    sessionId: conversation.sessionId,
+    updatedAt: conversation.updatedAt,
+  });
+  for (const [key, session] of sessions) {
+    if (Date.now() - session.updatedAt > SESSION_TTL_MS) sessions.delete(key);
+  }
+  const state = { version: 1, sessions: Object.fromEntries(sessions) };
+  const directory = path.dirname(conversation.statePath);
+  const temporary = `${conversation.statePath}.${process.pid}.tmp`;
+  try {
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    fs.renameSync(temporary, conversation.statePath);
+  } catch (error: any) {
+    try {
+      fs.rmSync(temporary, { force: true });
+    } catch {
+      // Preserve original persistence error.
+    }
+    console.error(
+      `[cursor-acp] Failed to persist session state: ${error.message}`,
+    );
+  }
+}
+
+function firstHeader(
+  request: CallCursorResponsesOptions["request"],
+  name: string,
+): string {
+  const value = request.headers?.[name.toLowerCase()];
+  if (Array.isArray(value)) return String(value[0] || "").trim();
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function stableConversationId(
+  request: CallCursorResponsesOptions["request"],
+): string {
+  return (
+    firstHeader(request, "thread-id") ||
+    firstHeader(request, "session-id") ||
+    firstHeader(request, "x-client-request-id") ||
+    firstHeader(request, "thread_id") ||
+    firstHeader(request, "session_id") ||
+    firstHeader(request, "conversation_id")
+  );
+}
+
+function conversationKey(model: string, workspace: string, id: string): string {
+  return `${model}\u0000${workspace}\u0000${id}`;
+}
+
+function pruneConversations(now = Date.now()): void {
+  for (const [key, conversation] of conversations) {
+    if (now - conversation.updatedAt > SESSION_TTL_MS)
+      conversations.delete(key);
+  }
+  for (const [responseId, conversation] of responseConversations) {
+    if (now - conversation.updatedAt > STORE_TTL_MS) {
+      responseConversations.delete(responseId);
+    }
+  }
+}
+
+function getConversation(
+  options: CallCursorResponsesOptions,
+  model: string,
+  workspace: string,
+  responseId: string,
+): CursorAcpConversation {
+  pruneConversations();
+  const body = options.body ?? options.request.body;
+  const stableId = stableConversationId(options.request);
+  const statePath = path.join(
+    options.config["auth-dir"],
+    "cursor-acp-sessions.json",
+  );
+  const previousResponseId =
+    typeof body?.previous_response_id === "string"
+      ? body.previous_response_id.trim()
+      : "";
+  let conversation = previousResponseId
+    ? responseConversations.get(previousResponseId)
+    : undefined;
+  if (
+    conversation &&
+    (conversation.model !== model || conversation.workspace !== workspace)
+  ) {
+    conversation = undefined;
+  }
+
+  if (stableId) {
+    const key = conversationKey(model, workspace, stableId);
+    const stableConversation = conversations.get(key);
+    if (stableConversation) conversation = stableConversation;
+    else if (conversation) {
+      conversation.persistentKey = key;
+      conversation.statePath = statePath;
+      conversations.set(key, conversation);
+    } else {
+      const persisted = loadPersistedSessions(statePath).get(key);
+      conversation = {
+        model,
+        workspace,
+        persistentKey: key,
+        statePath,
+        sessionId: persisted?.sessionId,
+        updatedAt: persisted?.updatedAt || Date.now(),
+        tail: Promise.resolve(),
+      };
+      conversations.set(key, conversation);
+    }
+  }
+
+  conversation ||= {
+    model,
+    workspace,
+    tail: Promise.resolve(),
+    updatedAt: Date.now(),
+  };
+  conversation.updatedAt = Date.now();
+  responseConversations.set(responseId, conversation);
+  return conversation;
+}
+
+async function withConversationTurn<T>(
+  conversation: CursorAcpConversation,
+  turn: () => Promise<T>,
+): Promise<T> {
+  const previous = conversation.tail;
+  let release!: () => void;
+  conversation.tail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    conversation.updatedAt = Date.now();
+    return await turn();
+  } finally {
+    conversation.updatedAt = Date.now();
+    persistConversation(conversation);
+    release();
+  }
+}
+
+function continuationPrompt(body: any): string {
+  const input = body?.input ?? body?.messages;
+  if (typeof input === "string") return input || "Continue.";
+  if (Array.isArray(input)) {
+    for (let index = input.length - 1; index >= 0; index--) {
+      const item = input[index];
+      if (typeof item === "string") return item;
+      const role = String(item?.role || "").toLowerCase();
+      const type = String(item?.type || "").toLowerCase();
+      if (role === "user" || type === "function_call_output") {
+        const text =
+          contentText(item?.content) ||
+          contentText(item?.output) ||
+          contentText(item?.text);
+        if (text) return text;
+      }
+    }
+  }
+  return promptFromBody(body);
+}
+
+async function ensureConversationSession(
+  conversation: CursorAcpConversation,
+  connection: CursorAcpConnection,
+): Promise<{ sessionId: string; continued: boolean }> {
+  if (
+    conversation.connection === connection &&
+    conversation.sessionId &&
+    !connection.isClosed
+  ) {
+    return { sessionId: conversation.sessionId, continued: true };
+  }
+
+  const previousSessionId = conversation.sessionId;
+  if (previousSessionId) {
+    try {
+      if (connection.canResumeSession) {
+        await connection.request("session/resume", {
+          sessionId: previousSessionId,
+          cwd: conversation.workspace,
+          mcpServers: [],
+        });
+        conversation.connection = connection;
+        return { sessionId: previousSessionId, continued: true };
+      }
+      if (connection.canLoadSession) {
+        await connection.request("session/load", {
+          sessionId: previousSessionId,
+          cwd: conversation.workspace,
+          mcpServers: [],
+        });
+        conversation.connection = connection;
+        return { sessionId: previousSessionId, continued: true };
+      }
+    } catch {
+      // Fall through to a fresh session and replay the request context.
+    }
+  }
+
+  const session = await connection.request("session/new", {
+    cwd: conversation.workspace,
+    mcpServers: [],
+  });
+  conversation.connection = connection;
+  conversation.sessionId = String(session.sessionId);
+  return { sessionId: conversation.sessionId, continued: false };
+}
 
 export function getCursorAcpResponse(
   responseId: string,
@@ -299,6 +583,16 @@ export function cancelCursorAcpResponse(responseId: string): boolean {
   if (!cancel) return false;
   cancel();
   return true;
+}
+
+export function steerCursorAcpResponse(
+  responseId: string,
+): { model: string } | undefined {
+  const stored = getCursorAcpResponse(responseId);
+  const conversation = responseConversations.get(responseId);
+  if (stored?.status !== "in_progress" || !conversation) return undefined;
+  if (!cancelCursorAcpResponse(responseId)) return undefined;
+  return { model: `cursor-${conversation.model}` };
 }
 
 async function getConnection(model: string): Promise<CursorAcpConnection> {
@@ -321,6 +615,9 @@ async function getConnection(model: string): Promise<CursorAcpConnection> {
 export async function __disposeCursorAcpPools(): Promise<void> {
   const connections = [...pools.values()];
   pools.clear();
+  conversations.clear();
+  responseConversations.clear();
+  persistedSessions.clear();
   await Promise.allSettled(
     connections.map(async (value) => (await value).dispose()),
   );
@@ -359,6 +656,7 @@ export async function callCursorAcpResponses(
   const messageId = `msg_cursor_${randomUUID()}`;
   const reasoningId = `rs_cursor_${randomUUID()}`;
   const createdAt = Math.floor(Date.now() / 1000);
+  const conversation = getConversation(options, model, workspace, responseId);
   responseStore.set(responseId, {
     id: responseId,
     status: "in_progress",
@@ -636,24 +934,33 @@ export async function callCursorAcpResponses(
       });
       void (async () => {
         try {
-          connection = await getConnection(model);
-          if (completed) return;
-          const session = await connection.request("session/new", {
-            cwd: workspace,
-            mcpServers: [],
+          await withConversationTurn(conversation, async () => {
+            connection = await getConnection(model);
+            if (completed) return;
+            const session = await ensureConversationSession(
+              conversation,
+              connection,
+            );
+            if (completed) return;
+            sessionId = session.sessionId;
+            stopSession = connection.onSession(sessionId, handleUpdate);
+            resetIdle();
+            await connection.request(
+              "session/prompt",
+              {
+                sessionId,
+                prompt: [
+                  {
+                    type: "text",
+                    text: session.continued
+                      ? continuationPrompt(body)
+                      : promptFromBody(body),
+                  },
+                ],
+              },
+              0,
+            );
           });
-          if (completed) return;
-          sessionId = String(session.sessionId);
-          stopSession = connection.onSession(sessionId, handleUpdate);
-          resetIdle();
-          await connection.request(
-            "session/prompt",
-            {
-              sessionId,
-              prompt: [{ type: "text", text: promptFromBody(body) }],
-            },
-            0,
-          );
           finish();
         } catch (error) {
           finish(error instanceof Error ? error : new Error(String(error)));

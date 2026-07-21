@@ -37,13 +37,18 @@ test(
     };
 
     try {
+      const request = {
+        body: {},
+        path: "/v1/responses",
+        headers: { "thread-id": "live-composer-continuation" },
+      } as any;
       const response = await callCursorAcpResponses({
         body: {
           model: "cursor-composer-2-fast",
           input:
             "Read hello.txt with your file tool. Reply with only its exact content.",
         },
-        request: { body: {}, path: "/v1/responses" } as any,
+        request,
         account: {} as any,
         config,
         responseFormat: "openai-responses",
@@ -53,6 +58,27 @@ test(
       assert.match(stream, /HELLO_FROM_ACP/);
       assert.match(stream, /event: response\.completed/);
       assert.doesNotMatch(stream, /event: response\.failed/);
+
+      const firstSessionId = stream.match(/"cursor_session_id":"([^"]+)"/)?.[1];
+      assert.ok(firstSessionId);
+      const continued = await callCursorAcpResponses({
+        body: {
+          model: "cursor-composer-2-fast",
+          input:
+            "Without reading the file again, reply with only the exact content you returned in the previous turn.",
+        },
+        request,
+        account: {} as any,
+        config,
+        responseFormat: "openai-responses",
+      });
+      const continuedStream = await continued.text();
+      assert.match(continuedStream, /HELLO_FROM_ACP/);
+      assert.match(
+        continuedStream,
+        new RegExp(`"cursor_session_id":"${firstSessionId}"`),
+      );
+      assert.doesNotMatch(continuedStream, /event: response\.failed/);
     } finally {
       await __disposeCursorAcpPools();
       await fs.rm(workspace, { recursive: true, force: true });

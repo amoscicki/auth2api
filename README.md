@@ -270,9 +270,11 @@ Off-the-shelf OpenAI Responses / Chat / Claude Code clients all just work withou
 
 #### Cursor ACP `/v1/responses`
 
-The ACP bridge starts one persistent Cursor process per selected model and creates a fresh ACP session per request. It translates assistant text and ACP thought chunks to standard Responses SSE. Plan and tool progress remain visible through `response.cursor.plan`, `response.cursor.tool_call`, `response.cursor.tool_call_update`, and `response.cursor.session_update` events. Heartbeat comments (`: ping`) keep quiet long-running turns connected.
+The ACP bridge starts one persistent Cursor process per selected model. Requests carrying the same Codex `thread-id`/`session-id` reuse one native Cursor ACP session; generic Responses clients can continue with `previous_response_id`. Only the new user turn is sent on continuation. Session mappings persist for 30 days in `<auth-dir>/cursor-acp-sessions.json`, and Cursor's `session/load` restores them after a proxy restart. Turns for one session are serialized.
 
-Client disconnect does not cancel Cursor. Save the response ID from `response.created`, then fetch `GET /v1/responses/:responseId`; in-progress results return `202`, terminal results return `200`. `POST /v1/responses/:responseId/cancel` sends ACP `session/cancel`. Results live in memory for one hour, so a proxy restart loses them. Images and Responses structured-output schemas are not translated.
+Assistant text and ACP thought chunks become standard Responses SSE. Plan and tool progress remain visible through `response.cursor.plan`, `response.cursor.tool_call`, `response.cursor.tool_call_update`, and `response.cursor.session_update` events. Heartbeat comments (`: ping`) keep quiet long-running turns connected.
+
+Client disconnect does not cancel Cursor. Save the response ID from `response.created`, then fetch `GET /v1/responses/:responseId`; in-progress results return `202`, terminal results return `200`. `POST /v1/responses/:responseId/cancel` sends ACP `session/cancel`. `POST /v1/responses/:responseId/steer` with `{"input":"new direction"}` cancels the active turn, then starts the steering prompt on the same Cursor session and returns its SSE stream. Detached response bodies live in memory for one hour, so a proxy restart loses those bodies even though native session continuation survives. Images and Responses structured-output schemas are not translated.
 
 `transport: legacy` restores the old HTTP/2 + protobuf path for older Cursor deployments. Its previous single-turn text and version-gate limitations still apply.
 
@@ -284,6 +286,7 @@ Client disconnect does not cancel Cursor. Save the response ID from `response.cr
 | `POST /v1/responses`             | OpenAI Responses API compatibility                                    |
 | `GET /v1/responses/:id`          | Fetch detached Cursor ACP result                                      |
 | `POST /v1/responses/:id/cancel`  | Cancel active Cursor ACP turn                                         |
+| `POST /v1/responses/:id/steer`   | Interrupt active turn and continue same Cursor session                |
 | `POST /v1/messages`              | Claude native passthrough                                             |
 | `POST /v1/messages/count_tokens` | Claude token counting                                                 |
 | `GET /v1/models`                 | List available models                                                 |
