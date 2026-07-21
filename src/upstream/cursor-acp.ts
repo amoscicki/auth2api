@@ -717,13 +717,16 @@ export async function __disposeCursorAcpPools(): Promise<void> {
 // item is steer input delivered by Codex between sampling requests.
 // ---------------------------------------------------------------------------
 
+const BOUNDARY_CALL_PREFIX = "call_cursor_";
+
 type RequestClass =
   | { kind: "new" }
   | { kind: "continuation"; turn: TurnRun }
-  | { kind: "steer"; turn: TurnRun; steerText: string };
+  | { kind: "steer"; turn: TurnRun | undefined; steerText: string }
+  /** Boundary outputs present but no live turn (proxy restarted mid-turn). */
+  | { kind: "resume" };
 
 function classifyRequest(body: any, turn: TurnRun | undefined): RequestClass {
-  if (!turn) return { kind: "new" };
   const input = body?.input ?? body?.messages;
   if (!Array.isArray(input)) return { kind: "new" };
   let lastBoundaryIndex = -1;
@@ -731,7 +734,7 @@ function classifyRequest(body: any, turn: TurnRun | undefined): RequestClass {
     const item = input[index];
     if (
       item?.type === "function_call_output" &&
-      turn.boundaryCallIds.has(String(item?.call_id || ""))
+      String(item?.call_id || "").startsWith(BOUNDARY_CALL_PREFIX)
     ) {
       lastBoundaryIndex = index;
       break;
@@ -751,8 +754,16 @@ function classifyRequest(body: any, turn: TurnRun | undefined): RequestClass {
   if (steerParts.length > 0) {
     return { kind: "steer", turn, steerText: steerParts.join("\n\n") };
   }
-  return { kind: "continuation", turn };
+  if (turn) return { kind: "continuation", turn };
+  // Codex is following up on a tool boundary we no longer know about: the
+  // proxy (and its cursor-agent child) restarted mid-turn. The session map is
+  // persisted, so resume the Cursor session and tell it to keep going.
+  return { kind: "resume" };
 }
+
+const RESUME_PROMPT =
+  "The connection was interrupted and restored. Continue the current task " +
+  "from where you left off. If it is already complete, summarize the result.";
 
 function segmentFromUpdate(
   turn: TurnRun,
@@ -1173,6 +1184,10 @@ export async function callCursorAcpResponses(
 
           if (classified.kind === "continuation") {
             turn = classified.turn;
+          } else if (classified.kind === "resume") {
+            // Proxy restarted mid-turn; the persisted session map lets us
+            // resume the Cursor session and nudge it to keep going.
+            turn = await startTurn(conversation, model, RESUME_PROMPT);
           } else {
             if (existing) {
               // New prompt or steer while a turn is live: cancel -> send on

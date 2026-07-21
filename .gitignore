@@ -14,5 +14,5 @@ config.yaml
 .DS_Store
 Thumbs.db
 
-proxy-local.log
-proxy-local.err.log
+# Local runtime state accidentally created in repo root
+~/

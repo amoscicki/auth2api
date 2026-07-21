@@ -1,6 +1,10 @@
 # Codex Tool Bridge — plan (ACP -> Responses z trwałymi tool callami i natywnym steer)
 
-Status: PLAN (nic nie wdrożone). Data: 2026-07-21.
+Status: F0-F4 WDROŻONE + resumability po restarcie proxy zweryfikowana (test 50 plików, kill przy 9, resume, kontynuacja). Data: 2026-07-21.
+
+Backlog (opcja, nie robimy teraz): shim-supervisor trzymający stdio cursor-agenta
+(`proxy <-tcp/pipe-> shim <-stdio-> agent`), żeby pad proxy nie zabijał agenta i tury w locie.
+Sens dopiero przy bardzo drogich turach; dziś resume (session/resume + Codex stream retry) wystarcza.
 Właściciel: auth2api, branch `codex/cursor-api-key-check` (ACP bridge: commity `752b1a9`, `6028b14`).
 Referencyjny kod Codexa: `P:\tmp\codex-cli` (shallow clone openai/codex, do wywalenia po robocie).
 
