@@ -875,17 +875,8 @@ async function startTurn(
 export async function callCursorAcpResponses(
   options: CallCursorResponsesOptions,
 ): Promise<Response> {
-  if (!process.env.CURSOR_API_KEY) {
-    return Response.json(
-      {
-        error: {
-          message: "CURSOR_API_KEY is not set",
-          type: "authentication_error",
-        },
-      },
-      { status: 401 },
-    );
-  }
+  // No CURSOR_API_KEY requirement here: the spawned cursor-agent authenticates
+  // with its own login store (and picks up CURSOR_API_KEY from env if set).
   if ((options.responseFormat || "openai-responses") !== "openai-responses") {
     return Response.json(
       { error: { message: "ACP transport currently requires /v1/responses" } },
